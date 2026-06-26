@@ -1,0 +1,8 @@
+{
+  "name": "AUDScan",
+  "description": "Australian banknote verification app with real-time scanning, community intelligence, and business analytics.",
+  "requestFramePermissions": [
+    "camera",
+    "notifications"
+  ]
+}
