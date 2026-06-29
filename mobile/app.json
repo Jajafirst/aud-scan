@@ -1,5 +1,8 @@
 {
   "ios": {
     "bundleIdentifier": "com.anonymous.audscan-mobile"
+  },
+  "android": {
+    "package": "com.anonymous.audscanmobile"
   }
 }
