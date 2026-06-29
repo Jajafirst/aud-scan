@@ -1,232 +1,123 @@
 import React from 'react';
-import { Camera, Bell, AlertTriangle, ChevronRight, History } from 'lucide-react';
-import { motion } from 'motion/react';
-import { cn } from '@/src/lib/utils';
-import { Theme } from '@/src/Theme';
-import { useAccessibility } from '@/src/contexts/AccessibilityContext';
-import { useAlerts } from '@/src/contexts/AlertContext';
-import { useHistory } from '@/src/contexts/HistoryContext';
-import { useNavigate } from 'react-router-dom';
+import { View, Text, ScrollView, TouchableOpacity, StyleSheet, StatusBar } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { Camera, Bell, AlertTriangle, ChevronRight, History } from 'lucide-react-native';
+import { useNavigation } from '@react-navigation/native';
 import { formatDistanceToNow } from 'date-fns';
-import { GlobalFooter } from '@/src/components/GlobalFooter';
+import { Theme } from '../Theme';
+import { useAccessibility } from '../contexts/AccessibilityContext';
+import { useAlerts } from '../contexts/AlertContext';
+import { useHistory } from '../contexts/HistoryContext';
 
 export function HomeScreen() {
-  const { isLargeTextEnabled, isHighContrastEnabled } = useAccessibility();
+  const navigation = useNavigation<any>();
+  const { isHighContrastEnabled, isLargeTextEnabled } = useAccessibility();
   const { filteredAlerts, unreadCount } = useAlerts();
   const { scans } = useHistory();
-  const navigate = useNavigate();
-
   const latestAlert = filteredAlerts[0];
   const recentScans = scans.slice(0, 5);
+  const hc = isHighContrastEnabled;
+  const goldColor = hc ? '#CCFF00' : Theme.colors.gold;
 
   return (
-    <motion.div 
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      className={cn(
-        "flex-1 flex flex-col p-6 pt-10",
-        isHighContrastEnabled ? "bg-black" : "bg-bg",
-        isLargeTextEnabled && "text-lg"
-      )}
-    >
-      {/* Header */}
-      <header className="flex justify-between items-start mb-8">
-        <div className="flex flex-col">
-          <h1 className={cn(
-            "text-3xl font-extrabold italic text-gold tracking-tight",
-            isHighContrastEnabled && "text-[#CCFF00]",
-            isLargeTextEnabled && "text-4xl"
-          )}>
-            AUDScan
-          </h1>
-          {/* AI Verification Badge */}
-          <div 
-            className="self-start flex items-center px-1.5 py-0.5 rounded border select-none"
-            style={{
-              backgroundColor: 'rgba(212,168,67,0.1)',
-              borderColor: 'rgba(212,168,67,0.25)',
-              marginTop: '4px'
-            }}
-          >
-            <span 
-              className="text-[9px] tracking-wider font-semibold"
-              style={{ 
-                fontFamily: 'JetBrains Mono, monospace',
-                color: '#E5B854'
-              }}
-            >
-              🤖 AI-ASSISTED VERIFICATION
-            </span>
-          </div>
-        </div>
-        <button 
-          onClick={() => navigate('/alerts')}
-          className={cn(
-            "p-2.5 bg-surface-2 rounded-full border border-border relative active:scale-90 transition-transform",
-            isHighContrastEnabled && "bg-black border-2 border-[#CCFF00]"
-          )}
-        >
-          <Bell size={20} className={cn("text-text-mid", isHighContrastEnabled && "text-[#CCFF00]")} />
-          {unreadCount > 0 && (
-            <span className={cn(
-              "absolute -top-1 -right-1 w-5 h-5 bg-red rounded-full border-2 border-surface-2 flex items-center justify-center text-[10px] font-black text-white",
-              isHighContrastEnabled && "bg-[#CCFF00] text-black border-black"
-            )}>
-              {unreadCount}
-            </span>
-          )}
-        </button>
-      </header>
-
-      {/* Alert Banner */}
-      {latestAlert && (
-        <motion.div 
-          initial={{ y: -10, opacity: 0 }}
-          animate={{ y: 0, opacity: 1 }}
-          transition={{ delay: 0.2 }}
-          onClick={() => navigate(`/alerts?id=${latestAlert.id}`)}
-          className={cn(
-            "bg-red/10 border border-red/30 rounded-2xl p-4 flex gap-4 mb-8 shadow-lg shadow-red/5 cursor-pointer active:scale-[0.98] transition-transform",
-            isHighContrastEnabled && "bg-black border-2 border-[#CCFF00]"
-          )}
-          role="button"
-          aria-label={`Warning: ${latestAlert.title}. Source: ${latestAlert.source}`}
-        >
-          <div className={cn(
-            "w-10 h-10 bg-red/20 rounded-xl flex items-center justify-center shrink-0",
-            isHighContrastEnabled && "bg-black border border-[#CCFF00]"
-          )}>
-            <AlertTriangle size={20} className={cn("text-red", isHighContrastEnabled && "text-[#CCFF00]")} />
-          </div>
-          <div className="flex-1">
-            <h3 className={cn(
-              "text-xs font-bold text-red uppercase tracking-widest mb-1",
-              isHighContrastEnabled && "text-[#CCFF00] font-black text-sm"
-            )}>{latestAlert.state} Alert</h3>
-            <p className={cn(
-              "text-sm text-text-mid leading-snug line-clamp-2",
-              isHighContrastEnabled && "text-white font-black text-base"
-            )}>
-              {latestAlert.title}
-            </p>
-            {/* Dynamic source metadata */}
-            <div 
-              style={{
-                fontSize: '8px',
-                fontWeight: 400,
-                color: '#6B8099',
-                paddingTop: '4px'
-              }}
-              className="antialiased"
-            >
-              Source: {latestAlert.source}
-            </div>
-          </div>
-        </motion.div>
-      )}
-
-      {/* Primary Action - Centered */}
-      <div className="flex-1 flex flex-col items-center justify-center mb-8">
-        <motion.button 
-          whileHover={{ scale: 1.02 }}
-          whileTap={{ scale: 0.98 }}
-          onClick={() => navigate('/scan')}
-          className={cn(
-            "w-full max-w-[240px] aspect-square rounded-[40px] bg-gold flex flex-col items-center justify-center gap-4 shadow-[0_20px_50px_rgba(212,168,67,0.3)] group relative overflow-hidden",
-            isHighContrastEnabled && "bg-[#CCFF00] border-8 border-black shadow-[#CCFF00]/20"
-          )}
-        >
-          <div className="absolute inset-0 bg-gradient-to-br from-white/20 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
-          <div className={cn(
-            "w-16 h-16 bg-bg/10 rounded-full flex items-center justify-center mb-1",
-            isHighContrastEnabled && "bg-black/20"
-          )}>
-            <Camera size={32} className="text-bg" />
-          </div>
-          <span className="text-bg font-black text-lg tracking-[0.1em] uppercase">Scan a Note</span>
-          <div className="absolute bottom-6 flex items-center gap-2 text-bg/60 text-[10px] font-bold uppercase tracking-widest">
-            <span>Start Verification</span>
-            <ChevronRight size={12} />
-          </div>
-        </motion.button>
-      </div>
-
-      {/* Recent Scans - Horizontal */}
-      <section className="mt-auto">
-        <div className="flex items-center justify-between mb-4 px-1">
-          <div className="flex items-center gap-2">
-            <History size={14} className={cn("text-text-dim", isHighContrastEnabled && "text-[#CCFF00]")} />
-            <h2 className={cn(
-              "text-[10px] text-text-dim font-bold tracking-[0.2em] uppercase",
-              isHighContrastEnabled && "text-white font-black text-xs"
-            )}>Recent Scans</h2>
-          </div>
-          <button 
-            onClick={() => navigate('/settings/history')}
-            className={cn(
-              "text-[10px] text-gold font-bold uppercase tracking-widest hover:underline",
-              isHighContrastEnabled && "text-[#CCFF00] text-xs"
+    <SafeAreaView style={[styles.safe, { backgroundColor: hc ? '#000' : Theme.colors.background }]}>
+      <StatusBar barStyle="light-content" />
+      <ScrollView style={{ flex: 1 }} contentContainerStyle={styles.container} showsVerticalScrollIndicator={false}>
+        <View style={styles.header}>
+          <View>
+            <Text style={[styles.logo, { color: goldColor }, isLargeTextEnabled && { fontSize: 38 }]}>AUDScan</Text>
+            <Text style={[styles.tagline, { color: hc ? '#CCFF00' : Theme.colors.goldText }]}>AI-ASSISTED VERIFICATION</Text>
+          </View>
+          <TouchableOpacity style={[styles.bellBtn, hc && { borderColor: '#CCFF00', borderWidth: 2 }]} onPress={() => navigation.navigate('Alerts')}>
+            <Bell size={20} color={hc ? '#CCFF00' : Theme.colors.textMid} />
+            {unreadCount > 0 && (
+              <View style={styles.badge}><Text style={styles.badgeNum}>{unreadCount}</Text></View>
             )}
+          </TouchableOpacity>
+        </View>
+
+        {latestAlert && (
+          <TouchableOpacity style={[styles.alertBanner, hc && { backgroundColor: '#000', borderColor: '#CCFF00', borderWidth: 2 }]} onPress={() => navigation.navigate('Alerts')}>
+            <AlertTriangle size={20} color={hc ? '#CCFF00' : Theme.colors.red} />
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.alertState, hc && { color: '#CCFF00' }]}>{latestAlert.state} Alert</Text>
+              <Text style={[styles.alertTitle, hc && { color: '#fff' }]} numberOfLines={1}>{latestAlert.title}</Text>
+            </View>
+          </TouchableOpacity>
+        )}
+
+        <View style={styles.scanCenter}>
+          <TouchableOpacity
+            onPress={() => navigation.navigate('Scan')}
+            style={[styles.scanBtn, hc && { backgroundColor: '#CCFF00', borderWidth: 8, borderColor: '#000' }]}
+            accessibilityLabel="Scan a banknote"
           >
-            View All
-          </button>
-        </div>
-        
-        <div className="flex gap-4 overflow-x-auto pb-4 scrollbar-hide -mx-6 px-6">
-          {recentScans.length > 0 ? (
-            recentScans.map((scan, index) => (
-              <motion.div 
-                key={scan.id}
-                initial={{ opacity: 0, x: 20 }}
-                animate={{ opacity: 1, x: 0 }}
-                transition={{ delay: 0.4 + index * 0.1 }}
-                onClick={() => navigate('/settings/history', { state: { selectedId: scan.id } })}
-                className={cn(
-                  "min-w-[140px] p-4 bg-surface-2 rounded-2xl border border-border flex flex-col gap-3 active:bg-surface-3 transition-colors cursor-pointer",
-                  isHighContrastEnabled && "bg-black border-2 border-[#CCFF00]"
-                )}
-              >
-                <div className="flex justify-between items-start">
-                  <div className={cn(
-                    "w-8 h-8 bg-bg rounded-lg flex items-center justify-center text-sm font-bold text-text-mid",
-                    isHighContrastEnabled && "bg-black border border-[#CCFF00] text-[#CCFF00]"
-                  )}>
-                    ${scan.denomination}
-                  </div>
-                  <div 
-                    className="w-2 h-2 rounded-full" 
-                    style={{ 
-                      backgroundColor: isHighContrastEnabled ? '#CCFF00' : (scan.verdict === 'PASS' ? Theme.colors.green : Theme.colors.red), 
-                      boxShadow: `0 0 10px ${isHighContrastEnabled ? '#CCFF00' : (scan.verdict === 'PASS' ? Theme.colors.green : Theme.colors.red)}` 
-                    }} 
-                  />
-                </div>
-                <div>
-                  <div className={cn(
-                    "text-[10px] text-text-dim font-mono uppercase mb-1",
-                    isHighContrastEnabled && "text-white font-black"
-                  )}>
-                    {formatDistanceToNow(new Date(scan.timestamp), { addSuffix: true })}
-                  </div>
-                  <div className={cn(
-                    "text-[10px] font-bold uppercase tracking-wider",
-                    scan.verdict === 'PASS' ? "text-green" : "text-amber",
-                    isHighContrastEnabled && "text-[#CCFF00] font-black text-xs"
-                  )}>
-                    {scan.verdict}
-                  </div>
-                </div>
-              </motion.div>
-            ))
-          ) : (
-            <div className="flex flex-col items-center justify-center w-full py-8 opacity-30">
-              <History size={32} className="mb-2" />
-              <span className="text-[10px] uppercase tracking-widest font-bold">No Scans Yet</span>
-            </div>
+            <Camera size={32} color={hc ? '#000' : Theme.colors.background} />
+            <Text style={[styles.scanLabel, hc && { color: '#000' }]}>Scan a Note</Text>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
+              <Text style={[styles.scanHint, hc && { color: 'rgba(0,0,0,0.8)' }]}>Start Verification</Text>
+              <ChevronRight size={12} color={hc ? 'rgba(0,0,0,0.8)' : 'rgba(8,11,15,0.6)'} />
+            </View>
+          </TouchableOpacity>
+        </View>
+
+        <View style={styles.recentHeader}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+            <History size={14} color={hc ? '#CCFF00' : Theme.colors.textDim} />
+            <Text style={[styles.recentLabel, hc && { color: '#fff' }]}>RECENT SCANS</Text>
+          </View>
+          <TouchableOpacity onPress={() => navigation.navigate('ScanHistory')}>
+            <Text style={[styles.viewAll, { color: goldColor }]}>View All</Text>
+          </TouchableOpacity>
+        </View>
+
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.scrollRow} contentContainerStyle={{ gap: 12, paddingRight: 24 }}>
+          {recentScans.length > 0 ? recentScans.map(scan => (
+            <TouchableOpacity key={scan.id} style={[styles.scanCard, hc && { backgroundColor: '#000', borderColor: '#CCFF00', borderWidth: 2 }]} onPress={() => navigation.navigate('ScanHistory', { selectedId: scan.id })}>
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                <Text style={[styles.denomText, hc && { color: '#CCFF00' }]}>${scan.denomination}</Text>
+                <View style={[styles.verdictDot, { backgroundColor: scan.verdict === 'PASS' ? Theme.colors.green : Theme.colors.red }]} />
+              </View>
+              <Text style={[styles.timeText, hc && { color: '#fff' }]}>{formatDistanceToNow(new Date(scan.timestamp), { addSuffix: true })}</Text>
+              <Text style={[styles.verdictText, { color: scan.verdict === 'PASS' ? Theme.colors.green : Theme.colors.amber }]}>{scan.verdict}</Text>
+            </TouchableOpacity>
+          )) : (
+            <View style={styles.emptyScans}>
+              <History size={28} color={Theme.colors.textDim} />
+              <Text style={styles.emptyText}>No Scans Yet</Text>
+            </View>
           )}
-        </div>
-      </section>
-      <GlobalFooter className="mt-8" />
-    </motion.div>
+        </ScrollView>
+      </ScrollView>
+    </SafeAreaView>
   );
 }
+
+const styles = StyleSheet.create({
+  safe: { flex: 1 },
+  container: { padding: 24, paddingTop: 16, paddingBottom: 40 },
+  header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 28 },
+  logo: { fontSize: 30, fontWeight: '900', fontStyle: 'italic', letterSpacing: -0.5 },
+  tagline: { fontSize: 9, letterSpacing: 1, fontWeight: '700', marginTop: 4 },
+  bellBtn: { padding: 10, backgroundColor: Theme.colors.surface2, borderRadius: 999, borderWidth: 1, borderColor: Theme.colors.border },
+  badge: { position: 'absolute', top: -4, right: -4, width: 18, height: 18, backgroundColor: Theme.colors.red, borderRadius: 9, alignItems: 'center', justifyContent: 'center' },
+  badgeNum: { color: '#fff', fontSize: 9, fontWeight: '900' },
+  alertBanner: { backgroundColor: 'rgba(240,90,90,0.10)', borderWidth: 1, borderColor: 'rgba(240,90,90,0.30)', borderRadius: 16, padding: 14, flexDirection: 'row', gap: 12, alignItems: 'center', marginBottom: 28 },
+  alertState: { fontSize: 10, fontWeight: '900', color: Theme.colors.red, textTransform: 'uppercase', letterSpacing: 2 },
+  alertTitle: { fontSize: 13, color: Theme.colors.textMid },
+  scanCenter: { alignItems: 'center', marginVertical: 24 },
+  scanBtn: { width: 220, height: 220, borderRadius: 40, backgroundColor: Theme.colors.gold, alignItems: 'center', justifyContent: 'center', gap: 12, shadowColor: Theme.colors.gold, shadowOpacity: 0.35, shadowRadius: 30, shadowOffset: { width: 0, height: 12 }, elevation: 12 },
+  scanLabel: { color: Theme.colors.background, fontWeight: '900', fontSize: 16, letterSpacing: 1.5, textTransform: 'uppercase' },
+  scanHint: { fontSize: 9, fontWeight: '700', textTransform: 'uppercase', letterSpacing: 2, color: 'rgba(8,11,15,0.6)' },
+  recentHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
+  recentLabel: { fontSize: 10, color: Theme.colors.textDim, fontWeight: '700', letterSpacing: 2 },
+  viewAll: { fontSize: 10, fontWeight: '700', textTransform: 'uppercase', letterSpacing: 2 },
+  scrollRow: { marginHorizontal: -24, paddingLeft: 24 },
+  scanCard: { minWidth: 130, padding: 14, backgroundColor: Theme.colors.surface2, borderRadius: 16, borderWidth: 1, borderColor: Theme.colors.border, gap: 8 },
+  denomText: { fontSize: 12, fontWeight: '700', color: Theme.colors.textMid },
+  verdictDot: { width: 8, height: 8, borderRadius: 4 },
+  timeText: { fontSize: 10, color: Theme.colors.textDim, textTransform: 'uppercase' },
+  verdictText: { fontSize: 10, fontWeight: '700', textTransform: 'uppercase', letterSpacing: 1 },
+  emptyScans: { alignItems: 'center', justifyContent: 'center', paddingVertical: 24, opacity: 0.3, gap: 6 },
+  emptyText: { fontSize: 10, textTransform: 'uppercase', letterSpacing: 2, fontWeight: '700', color: Theme.colors.textDim },
+});

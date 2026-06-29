@@ -1,89 +1,62 @@
-import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
-
-export type Verdict = 'PASS' | 'REVIEW';
+import React, { createContext, useContext, useState, useEffect } from 'react';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 export interface ScanRecord {
   id: string;
-  timestamp: string;
   denomination: number;
-  verdict: Verdict;
+  verdict: 'PASS' | 'REVIEW';
+  timestamp: string;
   serialNumber?: string;
-  staffId?: string;
-  tillNumber?: string;
-  image?: string;
   suburb?: string;
-  features: {
-    name: string;
-    passed: boolean;
-  }[];
+  image?: string;
+  checks?: { label: string; passed: boolean }[];
 }
 
 interface HistoryContextType {
   scans: ScanRecord[];
-  isBusinessAccount: boolean;
-  addScan: (scan: Omit<ScanRecord, 'id' | 'timestamp'>) => void;
+  addScan: (scan: ScanRecord) => void;
   clearHistory: () => void;
-  setBusinessAccount: (enabled: boolean) => void;
+  isBusinessAccount: boolean;
+  setBusinessAccount: (v: boolean) => void;
 }
 
-const HistoryContext = createContext<HistoryContextType | undefined>(undefined);
+const HistoryContext = createContext<HistoryContextType>({} as HistoryContextType);
 
 export function HistoryProvider({ children }: { children: React.ReactNode }) {
   const [scans, setScans] = useState<ScanRecord[]>([]);
   const [isBusinessAccount, setBusinessAccount] = useState(false);
 
-  // Load data from localStorage
   useEffect(() => {
-    const savedScans = localStorage.getItem('audscan_history');
-    const savedBusiness = localStorage.getItem('audscan_business_mode');
-    
-    if (savedScans) {
-      setScans(JSON.parse(savedScans));
-    }
-    if (savedBusiness) {
-      setBusinessAccount(JSON.parse(savedBusiness));
-    }
+    (async () => {
+      const raw = await AsyncStorage.getItem('scanHistory');
+      if (raw) setScans(JSON.parse(raw));
+      const biz = await AsyncStorage.getItem('isBusinessAccount');
+      if (biz) setBusinessAccount(biz === 'true');
+    })();
   }, []);
 
-  // Save data to localStorage
-  useEffect(() => {
-    localStorage.setItem('audscan_history', JSON.stringify(scans));
-  }, [scans]);
+  const addScan = async (scan: ScanRecord) => {
+    const updated = [scan, ...scans];
+    setScans(updated);
+    await AsyncStorage.setItem('scanHistory', JSON.stringify(updated));
+  };
 
-  useEffect(() => {
-    localStorage.setItem('audscan_business_mode', JSON.stringify(isBusinessAccount));
-  }, [isBusinessAccount]);
-
-  const addScan = useCallback((scan: Omit<ScanRecord, 'id' | 'timestamp'>) => {
-    const newScan: ScanRecord = {
-      ...scan,
-      id: Date.now().toString(),
-      timestamp: new Date().toISOString(),
-    };
-    setScans(prev => [newScan, ...prev]);
-  }, []);
-
-  const clearHistory = useCallback(() => {
+  const clearHistory = async () => {
     setScans([]);
-  }, []);
+    await AsyncStorage.removeItem('scanHistory');
+  };
 
   return (
-    <HistoryContext.Provider value={{ 
-      scans, 
-      isBusinessAccount, 
-      addScan, 
-      clearHistory, 
-      setBusinessAccount 
+    <HistoryContext.Provider value={{
+      scans, addScan, clearHistory, isBusinessAccount,
+      setBusinessAccount: async (v) => {
+        setBusinessAccount(v);
+        await AsyncStorage.setItem('isBusinessAccount', String(v));
+      },
     }}>
       {children}
     </HistoryContext.Provider>
   );
 }
 
-export function useHistory() {
-  const context = useContext(HistoryContext);
-  if (context === undefined) {
-    throw new Error('useHistory must be used within a HistoryProvider');
-  }
-  return context;
-}
+export const useHistory = () => useContext(HistoryContext);

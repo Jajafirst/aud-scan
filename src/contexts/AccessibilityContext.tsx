@@ -1,20 +1,22 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Haptics from 'expo-haptics';
 
-type HapticType = 'PASS' | 'REVIEW' | 'TICK' | 'MILESTONE' | 'DOUBLE_TICK' | 'SLOW_PULSE' | 'FLIP';
+type HapticType = 'TICK' | 'DOUBLE_TICK' | 'MILESTONE' | 'FLIP' | 'PASS' | 'REVIEW' | 'SLOW_PULSE';
 
 interface AccessibilityContextType {
   isHapticsEnabled: boolean;
+  setHapticsEnabled: (v: boolean) => void;
   isHighContrastEnabled: boolean;
+  setHighContrastEnabled: (v: boolean) => void;
   isAudioGuidanceEnabled: boolean;
+  setAudioGuidanceEnabled: (v: boolean) => void;
   isLargeTextEnabled: boolean;
-  setHapticsEnabled: (enabled: boolean) => void;
-  setHighContrastEnabled: (enabled: boolean) => void;
-  setAudioGuidanceEnabled: (enabled: boolean) => void;
-  setLargeTextEnabled: (enabled: boolean) => void;
+  setLargeTextEnabled: (v: boolean) => void;
   triggerHaptic: (type: HapticType) => void;
 }
 
-const AccessibilityContext = createContext<AccessibilityContextType | undefined>(undefined);
+const AccessibilityContext = createContext<AccessibilityContextType>({} as AccessibilityContextType);
 
 export function AccessibilityProvider({ children }: { children: React.ReactNode }) {
   const [isHapticsEnabled, setHapticsEnabled] = useState(true);
@@ -22,73 +24,48 @@ export function AccessibilityProvider({ children }: { children: React.ReactNode 
   const [isAudioGuidanceEnabled, setAudioGuidanceEnabled] = useState(false);
   const [isLargeTextEnabled, setLargeTextEnabled] = useState(false);
 
-  // Load settings from localStorage
   useEffect(() => {
-    const saved = localStorage.getItem('accessibility_settings');
-    if (saved) {
-      const parsed = JSON.parse(saved);
-      setHapticsEnabled(parsed.isHapticsEnabled ?? true);
-      setHighContrastEnabled(parsed.isHighContrastEnabled ?? false);
-      setAudioGuidanceEnabled(parsed.isAudioGuidanceEnabled ?? false);
-      setLargeTextEnabled(parsed.isLargeTextEnabled ?? false);
-    }
+    (async () => {
+      const [haptics, contrast, audio, largeText] = await Promise.all([
+        AsyncStorage.getItem('hapticsEnabled'),
+        AsyncStorage.getItem('highContrastEnabled'),
+        AsyncStorage.getItem('audioGuidanceEnabled'),
+        AsyncStorage.getItem('largeTextEnabled'),
+      ]);
+      if (haptics !== null) setHapticsEnabled(haptics === 'true');
+      if (contrast !== null) setHighContrastEnabled(contrast === 'true');
+      if (audio !== null) setAudioGuidanceEnabled(audio === 'true');
+      if (largeText !== null) setLargeTextEnabled(largeText === 'true');
+    })();
   }, []);
 
-  // Save settings to localStorage
-  useEffect(() => {
-    localStorage.setItem('accessibility_settings', JSON.stringify({
-      isHapticsEnabled,
-      isHighContrastEnabled,
-      isAudioGuidanceEnabled,
-      isLargeTextEnabled,
-    }));
-  }, [isHapticsEnabled, isHighContrastEnabled, isAudioGuidanceEnabled, isLargeTextEnabled]);
+  const persist = async (key: string, value: boolean) => {
+    await AsyncStorage.setItem(key, String(value));
+  };
 
   const triggerHaptic = (type: HapticType) => {
-    if (!isHapticsEnabled || !navigator.vibrate) return;
-
+    if (!isHapticsEnabled) return;
     switch (type) {
-      case 'PASS':
-        // 3 heavy impacts
-        navigator.vibrate([100, 50, 100, 50, 100]);
-        break;
-      case 'REVIEW':
-        // 1 long error vibration
-        navigator.vibrate(500);
-        break;
-      case 'TICK':
-        // Light selection tick
-        navigator.vibrate(10);
-        break;
-      case 'MILESTONE':
-        // Double tick for milestones
-        navigator.vibrate([15, 30, 15]);
-        break;
-      case 'DOUBLE_TICK':
-        // Strong double tick for series lock-in
-        navigator.vibrate([30, 40, 30]);
-        break;
-      case 'SLOW_PULSE':
-        // Slow pulse for orientation correction
-        navigator.vibrate([100, 400]);
-        break;
+      case 'TICK': Haptics.selectionAsync(); break;
+      case 'DOUBLE_TICK': Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success); break;
+      case 'MILESTONE': Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium); break;
+      case 'PASS': Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success); break;
+      case 'REVIEW': Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning); break;
       case 'FLIP':
-        // Distinct pattern for note flip instruction
-        navigator.vibrate([50, 100, 50, 100, 200]);
-        break;
+      case 'SLOW_PULSE': Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); break;
     }
   };
 
   return (
     <AccessibilityContext.Provider value={{
       isHapticsEnabled,
+      setHapticsEnabled: (v) => { setHapticsEnabled(v); persist('hapticsEnabled', v); },
       isHighContrastEnabled,
+      setHighContrastEnabled: (v) => { setHighContrastEnabled(v); persist('highContrastEnabled', v); },
       isAudioGuidanceEnabled,
+      setAudioGuidanceEnabled: (v) => { setAudioGuidanceEnabled(v); persist('audioGuidanceEnabled', v); },
       isLargeTextEnabled,
-      setHapticsEnabled,
-      setHighContrastEnabled,
-      setAudioGuidanceEnabled,
-      setLargeTextEnabled,
+      setLargeTextEnabled: (v) => { setLargeTextEnabled(v); persist('largeTextEnabled', v); },
       triggerHaptic,
     }}>
       {children}
@@ -96,10 +73,4 @@ export function AccessibilityProvider({ children }: { children: React.ReactNode 
   );
 }
 
-export function useAccessibility() {
-  const context = useContext(AccessibilityContext);
-  if (context === undefined) {
-    throw new Error('useAccessibility must be used within an AccessibilityProvider');
-  }
-  return context;
-}
+export const useAccessibility = () => useContext(AccessibilityContext);
