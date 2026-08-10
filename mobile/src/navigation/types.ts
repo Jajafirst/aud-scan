@@ -1,7 +1,7 @@
 export type RootStackParamList = {
   Main: undefined;
   Scan: undefined;
-  Verdict: { status: 'PASS' | 'REVIEW'; result?: any; serialNumber?: string };
+  Verdict: { status: 'PASS' | 'REVIEW'; result?: any; serialNumber?: string; denomination?: number; confidence?: number };
   SecurityGuide: undefined;
   ScanHistory: { selectedId?: string } | undefined;
   Analytics: undefined;

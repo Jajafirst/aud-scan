@@ -1,6 +1,6 @@
 {
   "ios": {
-    "bundleIdentifier": "com.anonymous.audscan-mobile"
+    "bundleIdentifier": "com.jatupon.audscan"
   },
   "android": {
     "package": "com.anonymous.audscanmobile"
