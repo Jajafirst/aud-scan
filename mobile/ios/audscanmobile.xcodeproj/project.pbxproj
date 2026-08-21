@@ -26,7 +26,7 @@
 		B80793FBA21394EC2DB78343 /* Pods-audscanmobile.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-audscanmobile.release.xcconfig"; path = "Target Support Files/Pods-audscanmobile/Pods-audscanmobile.release.xcconfig"; sourceTree = "<group>"; };
 		BB2F792C24A3F905000567C9 /* Expo.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; path = Expo.plist; sourceTree = "<group>"; };
 		C3CEA315177B640DAA5A9A81 /* ExpoModulesProvider.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ExpoModulesProvider.swift; path = "Pods/Target Support Files/Pods-audscanmobile/ExpoModulesProvider.swift"; sourceTree = "<group>"; };
-		E983D9059435B363E334AA18 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; includeInIndex = 1; name = PrivacyInfo.xcprivacy; path = audscanmobile/PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+		E983D9059435B363E334AA18 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xml; name = PrivacyInfo.xcprivacy; path = audscanmobile/PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		ED297162215061F000B7C4FE /* JavaScriptCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = JavaScriptCore.framework; path = System/Library/Frameworks/JavaScriptCore.framework; sourceTree = SDKROOT; };
 		F11748412D0307B40044C1D9 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AppDelegate.swift; path = audscanmobile/AppDelegate.swift; sourceTree = "<group>"; };
 		F11748442D0722820044C1D9 /* audscanmobile-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = "audscanmobile-Bridging-Header.h"; path = "audscanmobile/audscanmobile-Bridging-Header.h"; sourceTree = "<group>"; };
@@ -81,7 +81,6 @@
 				7AF218E46036CB82DDB699E7 /* Pods-audscanmobile.debug.xcconfig */,
 				B80793FBA21394EC2DB78343 /* Pods-audscanmobile.release.xcconfig */,
 			);
-			name = Pods;
 			path = Pods;
 			sourceTree = "<group>";
 		};
@@ -166,7 +165,6 @@
 				LastUpgradeCheck = 1130;
 				TargetAttributes = {
 					13B07F861A680F5B00A75B9A = {
-						DevelopmentTeam = VTGBY92S33;
 						LastSwiftMigration = 1250;
 						ProvisioningStyle = Automatic;
 					};
@@ -390,7 +388,7 @@
 					"-lc++",
 				);
 				OTHER_SWIFT_FLAGS = "$(inherited) -D EXPO_CONFIGURATION_DEBUG";
-				PRODUCT_BUNDLE_IDENTIFIER = "com.jatupon.audscan";
+				PRODUCT_BUNDLE_IDENTIFIER = com.jatupon.audscan;
 				PRODUCT_NAME = audscanmobile;
 				SWIFT_OBJC_BRIDGING_HEADER = "audscanmobile/audscanmobile-Bridging-Header.h";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
@@ -424,7 +422,7 @@
 					"-lc++",
 				);
 				OTHER_SWIFT_FLAGS = "$(inherited) -D EXPO_CONFIGURATION_RELEASE";
-				PRODUCT_BUNDLE_IDENTIFIER = "com.jatupon.audscan";
+				PRODUCT_BUNDLE_IDENTIFIER = com.jatupon.audscan;
 				PRODUCT_NAME = audscanmobile;
 				SWIFT_OBJC_BRIDGING_HEADER = "audscanmobile/audscanmobile-Bridging-Header.h";
 				SWIFT_VERSION = 5.0;
