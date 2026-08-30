@@ -27,7 +27,6 @@ function formatSerial(serial: string): string {
   }
   return serial;
 }
-
 export function VerdictScreen() {
   const navigation = useNavigation<any>();
   const route = useRoute<Route>();
