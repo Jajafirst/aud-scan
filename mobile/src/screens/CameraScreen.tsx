@@ -80,7 +80,13 @@ const TH_NUMERAL_PATTERN_DIFF = 0.45;
 // a printed imitation of it cannot. The back gap is real but narrow, so the
 // back carries less weight in the score than the front.
 const TH_OVI_SWING_FRONT = 0.025;  // between fake 0.0060 and genuine 0.0566
-const TH_OVI_SWING_BACK  = 0.010;  // between fake 0.0062 and genuine 0.0150
+const TH_OVI_SWING_BACK  = 0.010;
+// Two patches of the same feature, aligned and contrast-normalised, are the
+// same appearance below this distance and a different one above it. Both
+// numbers are PROVISIONAL: the per-scan `dists=[...]` log exists so they can
+// be set from where genuine and counterfeit distances actually fall.
+const TH_PATCH_SAME = 0.60;
+const TH_MIN_STATES = 2;  // between fake 0.0062 and genuine 0.0150
 const TH_SHARPNESS_MIN   = 0.013;  // below genuine B 0.0207, above fake 0.0095
 const TH_DETAIL_MIN      = 0.012;  // genuine B 0.0202 vs fake 0.0197 — weak
 // Single-frame window variance is kept only for the log — it does not
@@ -311,6 +317,19 @@ function zoneChroma(img: tf.Tensor3D, denom: number | null, zone: Rect): number 
   return max.sub(min).mean().dataSync()[0];
 }
 
+// One zone reduced to a contrast-normalised patch. Normalising means the
+// comparison is of PATTERN, not brightness: the same picture at two exposures
+// must not count as two different appearances.
+function normalizedPatch(img: tf.Tensor3D, denom: number | null, zone: Rect): number[] {
+  const patch = tf.image.resizeBilinear(cropToNote(img, denom, zone), [PATCH_N, PATCH_N]).toFloat();
+  const pg = patch.slice([0, 0, 0], [-1, -1, 1]).mul(0.299)
+    .add(patch.slice([0, 0, 1], [-1, -1, 1]).mul(0.587))
+    .add(patch.slice([0, 0, 2], [-1, -1, 1]).mul(0.114)).div(255);
+  const m = pg.mean();
+  const sd = pg.sub(m).square().mean().sqrt();
+  return Array.from(pg.sub(m).div(sd.add(1e-4)).dataSync());
+}
+
 // Flying bird sits in the clear window — measure only there, under torch.
 //
 // Absolute brightness of the window was the original measure and it does not
@@ -330,7 +349,7 @@ function zoneChroma(img: tf.Tensor3D, denom: number | null, zone: Rect): number 
 //                this should rise and fall; a flat print keeps whatever
 //                structure it has at every angle.
 function analyzeBirdFrame(raw: Uint8Array, denom: number | null): {
-  brightness: number; ratio: number; variance: number;
+  brightness: number; ratio: number; variance: number; patch: number[];
 } {
   return tf.tidy(() => {
     const img  = decodeJpeg(raw, 3);
@@ -341,8 +360,9 @@ function analyzeBirdFrame(raw: Uint8Array, denom: number | null): {
       .toFloat().div(255).mean().dataSync()[0];
     const ratio    = ref > 0.01 ? win / ref : 0;
     const variance = zoneVariance(img, denom, z.window);
+    const patch    = normalizedPatch(img, denom, z.window);
     console.log(`[Bird] brightness=${brightness.toFixed(4)} win/ref=${win.toFixed(3)}/${ref.toFixed(3)} ratio=${ratio.toFixed(4)} var=${variance.toFixed(4)}`);
-    return { brightness, ratio, variance };
+    return { brightness, ratio, variance, patch };
   });
 }
 
@@ -425,14 +445,7 @@ function analyzePhase2Frame(raw: Uint8Array, denom: number | null) {
     // flat print lit from two sides gives the same picture at two exposures,
     // and without normalising, that exposure difference alone would look like
     // a change of shape.
-    const patch = tf.image.resizeBilinear(cropToNote(img, denom, z.numeral), [48, 48]).toFloat();
-    const pg    = patch.slice([0, 0, 0], [-1, -1, 1]).mul(0.299)
-      .add(patch.slice([0, 0, 1], [-1, -1, 1]).mul(0.587))
-      .add(patch.slice([0, 0, 2], [-1, -1, 1]).mul(0.114)).div(255);
-    const pMean = pg.mean();
-    const pStd  = pg.sub(pMean).square().mean().sqrt();
-    const norm  = pg.sub(pMean).div(pStd.add(1e-4));
-    const numeralPatch = Array.from(norm.dataSync());
+    const numeralPatch = normalizedPatch(img, denom, z.numeral);
 
     console.log(`[P2] sharp=${sharpness.toFixed(5)} detail=${noiseMean.toFixed(5)} oviChroma=${oviChroma.toFixed(4)} oviHue=${oviHue.toFixed(1)}°`);
     return { sharpness, detail: noiseMean, oviChroma, numeralPatch };
@@ -478,6 +491,39 @@ function alignedDifference(a: number[], b: number[]): number {
     }
   }
   return best === Infinity ? 0 : best;
+}
+
+// How many DISTINCT appearances a feature took across the captured frames.
+//
+// This is the test the note itself suggests. Photographs of a genuine $5 show
+// the numeral dome in three different states depending on how light rakes it:
+// blank, reversed, and normal. A counterfeit prints one picture, so it has
+// exactly one state at every angle no matter how bright or vivid it looks.
+//
+// Counting states is harder to fool than measuring magnitude. A stray
+// reflection or a wobble can inflate how MUCH a patch changes, but it cannot
+// manufacture a second stable appearance that recurs across frames.
+//
+// Greedy clustering: each frame joins the first state it closely matches,
+// otherwise it opens a new one. Patches are aligned before comparison, so a
+// handheld note drifting in frame does not split one state into several.
+function countDistinctStates(patches: number[][], sameThreshold: number): number {
+  const states: number[][] = [];
+  for (const p of patches) {
+    if (p.length !== PATCH_N * PATCH_N) continue;
+    if (!states.some(s => alignedDifference(s, p) < sameThreshold)) states.push(p);
+  }
+  return states.length;
+}
+
+// Every pairwise aligned distance, for the log. Reading these is how the
+// same/different boundary gets set from real notes instead of guessed.
+function patchDistances(patches: number[][]): number[] {
+  const out: number[] = [];
+  for (let i = 0; i < patches.length; i++)
+    for (let j = i + 1; j < patches.length; j++)
+      out.push(alignedDifference(patches[i], patches[j]));
+  return out;
 }
 
 function maxPatchDifference(patches: number[][]): number {
@@ -662,6 +708,7 @@ export function CameraScreen() {
   const birdBrightness = useRef<number[]>([]);
   const birdRatio      = useRef<number[]>([]);
   const birdVariance   = useRef<number[]>([]);
+  const birdPatches    = useRef<number[][]>([]);
   const busyRef = useRef(false);
   const settleUntilRef = useRef(0);
   const [settling, setSettling] = useState(false);
@@ -792,6 +839,7 @@ export function CameraScreen() {
     birdBrightness.current = [];
     birdRatio.current      = [];
     birdVariance.current   = [];
+    birdPatches.current    = [];
     setTorchOn(true);
     startRock();
     beginSettle();
@@ -827,6 +875,7 @@ export function CameraScreen() {
         birdBrightness.current.push(b.brightness);
         birdRatio.current.push(b.ratio);
         birdVariance.current.push(b.variance);
+        birdPatches.current.push(b.patch);
         runMlDenomination(raw);
         beginSettle();
       } catch {} finally { busyRef.current = false; }
@@ -849,10 +898,19 @@ export function CameraScreen() {
     // allowed to carry a verdict on its own, so its weight is cut in the score
     // and both other measures are logged for comparison. Whichever of the
     // three actually separates a matched pair becomes the real check.
-    const flyingBird = birdRatio.current.length >= 2 && ratioSwing < TH_BIRD_RATIO_SWING;
+    // The bird, like the numeral, takes distinct appearances as the light rakes
+    // across it rather than merely getting brighter. Counting those states is
+    // immune to the confound that wrecked the ratio measure: on the matched
+    // pair, ratioSwing read 0.6952 genuine against 0.2021 fake purely because
+    // the genuine note was held less steadily — its reference zone swung from
+    // 0.512 to 0.362 while the fake's barely moved. Hand movement cannot
+    // manufacture a second stable appearance.
+    const birdStates = countDistinctStates(birdPatches.current, TH_PATCH_SAME);
+    const flyingBird = birdPatches.current.length >= 2 && birdStates < TH_MIN_STATES;
     console.log(
-      `[Bird Final] frames=${vals.length} ratioSwing=${ratioSwing.toFixed(4)} ` +
-      `varSwing=${varSwing.toFixed(4)} absVar=${bVar.toFixed(4)} fail=${flyingBird}`,
+      `[Bird Final] frames=${vals.length} states=${birdStates} ` +
+      `dists=[${patchDistances(birdPatches.current).map(d => d.toFixed(3)).join(" ")}] ` +
+      `ratioSwing=${ratioSwing.toFixed(4)} varSwing=${varSwing.toFixed(4)} absVar=${bVar.toFixed(4)} fail=${flyingBird}`,
     );
     updateCheck("Flying Bird", flyingBird ? "fail" : "pass");
     startPhase1();
@@ -991,11 +1049,19 @@ export function CameraScreen() {
     // PATTERN changes across the tilt. Text recognition is not used: the dome
     // is holographic and low-contrast, and OCR returned nothing from any of
     // four candidate crops at 1400px, on both the genuine note and the fake.
-    const numeralDiff = maxPatchDifference(p2.current.numeralPatches);
-    const numeralRead = p2.current.numeralPatches.length >= 2;
-    p2.current.reversedOk     = numeralDiff >= TH_NUMERAL_PATTERN_DIFF;
+    const numeralDiff   = maxPatchDifference(p2.current.numeralPatches);
+    const numeralStates = countDistinctStates(p2.current.numeralPatches, TH_PATCH_SAME);
+    const numeralRead   = p2.current.numeralPatches.length >= 2;
+    // A genuine dome takes more than one appearance across the rock — blank,
+    // reversed, normal. A printed dome has exactly one at every angle.
+    p2.current.reversedOk     = numeralStates >= TH_MIN_STATES;
     p2.current.reverseSawText = numeralRead;
-    console.log(`[Reverse] frames=${p2.current.numeralPatches.length} patternDiff=${numeralDiff.toFixed(4)} → reversedOk=${p2.current.reversedOk}`);
+    console.log(
+      `[Reverse] frames=${p2.current.numeralPatches.length} states=${numeralStates} ` +
+      `patternDiff=${numeralDiff.toFixed(4)} ` +
+      `dists=[${patchDistances(p2.current.numeralPatches).map(d => d.toFixed(3)).join(" ")}] ` +
+      `→ reversedOk=${p2.current.reversedOk}`,
+    );
 
     // The old text-recognition attempt is kept behind the log only, so the
     // band sweep can still be inspected while the pattern test is calibrated.
