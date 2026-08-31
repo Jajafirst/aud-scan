@@ -26,7 +26,11 @@ const FRAME_INTERVAL  = 300;   // fires often; a busy guard drops overlapping ca
 // Grace period after a prompt changes, before the next capture starts. Without
 // it the shutter fired the instant the arrow moved, so every frame caught the
 // note mid-swing between positions instead of held at one.
-const SETTLE_MS       = 1600;
+// Time allowed to reach the requested position before a frame is taken. A
+// left-right rock arrives much sooner than the old up/down reach did, so this
+// came down with it. It still exists so frames are captured with the note
+// held, not mid-swing.
+const SETTLE_MS       = 1000;
 
 // Feature thresholds, from two scans of genuine $10 AK173948183 and one of
 // counterfeit AK173948185.
@@ -220,11 +224,15 @@ type ScanPhase = "loading" | "serial" | "bird" | "phase1" | "flip" | "phase2" | 
 type CheckStatus = "pending" | "pass" | "fail";
 interface CheckItem { label: string; status: CheckStatus }
 
+// Rocking left and right only. Up and down were dropped for two reasons: the
+// user reported reaching those positions was the hard part of the scan, and
+// the features being measured - optically variable ink and the reversing
+// numeral - respond to light raking ACROSS the note, which is the horizontal
+// axis. Four frames still get captured, two at each side, so nothing is lost
+// from the sample count; the motion between them is just far quicker to make.
 const TILT_HINTS = [
   { arrow: "←", label: "TILT LEFT" },
   { arrow: "→", label: "TILT RIGHT" },
-  { arrow: "↑", label: "TILT UP" },
-  { arrow: "↓", label: "TILT DOWN" },
 ];
 
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
@@ -599,12 +607,18 @@ export function CameraScreen() {
     bumpPattern: false,
     dynamicImage3d: false,
   });
+  const autoAdvancedRef = useRef(false);
+  // Mirrors `phase` so the deferred auto-advance can check the user has not
+  // already moved on (or cancelled) before it fires.
+  const phaseRef = useRef<ScanPhase>("loading");
   const birdBrightness = useRef<number[]>([]);
   const birdRatio      = useRef<number[]>([]);
   const birdVariance   = useRef<number[]>([]);
   const busyRef = useRef(false);
   const settleUntilRef = useRef(0);
   const [settling, setSettling] = useState(false);
+
+  useEffect(() => { phaseRef.current = phase; }, [phase]);
 
   const updateCheck = (label: string, status: "pass" | "fail") =>
     setChecks(prev => prev.map(c => c.label === label ? { ...c, status } : c));
@@ -675,6 +689,13 @@ export function CameraScreen() {
           setSerial(sn);
           setOcrStatus("found");
           updateCheck("Serial Number", "pass");
+          // Advance on its own once the serial is read. The confirm button
+          // asked the user to approve a number the app had already recognised,
+          // which is a decision with only one sensible answer.
+          if (!autoAdvancedRef.current) {
+            autoAdvancedRef.current = true;
+            setTimeout(() => { if (phaseRef.current === "serial") confirmSerial(); }, 900);
+          }
         } else {
           setOcrStatus("notfound");
         }
@@ -1283,7 +1304,7 @@ export function CameraScreen() {
             onPress={confirmSerial}
           >
             <Text style={[styles.btnText, !found && styles.btnGhostText]}>
-              {found ? "LOOKS GOOD — CONTINUE" : "SKIP & CONTINUE"}
+              {found ? "CONTINUING…" : "SKIP & CONTINUE"}
             </Text>
           </TouchableOpacity>
 
@@ -1339,7 +1360,7 @@ export function CameraScreen() {
         <ProgressBar />
         <Text style={styles.tip}>
           {settling
-            ? `Move to the ${TILT_HINTS[tiltHint].label.replace("TILT ", "").toLowerCase()} position`
+            ? `Tilt ${TILT_HINTS[tiltHint].label.replace("TILT ", "").toLowerCase()}`
             : "Hold it there — capturing"}
           {"  ·  "}{Math.round(progress * TARGET_FRAMES)}/{TARGET_FRAMES}
         </Text>
