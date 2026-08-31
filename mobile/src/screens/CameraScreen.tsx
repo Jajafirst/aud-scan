@@ -44,6 +44,10 @@ const SETTLE_MS       = 1600;
 // no longer decide anything on their own: they contribute only a small amount
 // of weight, and the verdict rests on the measures that held up across repeat
 // scans of the same note.
+//
+// Chroma is read separately per side. The front numeral measured 0.0946 and
+// the back only 0.0272 on the genuine note, so a single shared threshold (the
+// earlier 0.09, which was a guess) failed the back of a real note every time.
 const TH_BIRD_VARIANCE   = 0.070;  // between fake 0.0542 and genuine 0.10+
 const TH_SHARPNESS_MIN   = 0.013;  // below genuine B 0.0207, above fake 0.0095
 const TH_DETAIL_MIN      = 0.012;  // genuine B 0.0202 vs fake 0.0197 — weak
@@ -143,7 +147,7 @@ const cropFor = (d: number | null) => {
 // one feature. That is safe because the checks read PEAK chroma: dull
 // surroundings included in the crop cannot pull a maximum down, and whichever
 // feature happens to fire at a given angle is caught.
-interface NoteZones { rolling: Rect; reverse: Rect; window: Rect; ref: Rect }
+interface NoteZones { rolling: Rect; reverse: Rect; numeral: Rect; window: Rect; ref: Rect }
 
 // The series shares a design language — window roughly central, optical
 // features inside it — so this layout is the starting point for every note.
@@ -153,6 +157,12 @@ const ZONES_SERIES: NoteZones = {
   // Front and back OVI bands — the window strip plus a little margin
   rolling: { x0: 0.05, y0: 0.36, x1: 0.95, y1: 0.70 },
   reverse: { x0: 0.05, y0: 0.36, x1: 0.95, y1: 0.70 },
+  // The reversing numeral sits at one end of the window strip, in the dome on
+  // a $5. Reading the whole band gave OCR a busy image and it returned nothing
+  // at all — neither plain nor mirrored — so the check could only ever report
+  // failure. This narrower crop is upscaled before recognition so the digit is
+  // large enough to resolve.
+  numeral: { x0: 0.08, y0: 0.52, x1: 0.55, y1: 0.70 },
   window:  { x0: 0.10, y0: 0.38, x1: 0.90, y1: 0.68 }, // clear polymer window
   // Plain printed area with no optical features — the control for every
   // differential measurement. What happens here is lighting, not security ink.
@@ -253,7 +263,7 @@ function zoneVariance(img: tf.Tensor3D, denom: number | null, zone: Rect): numbe
 }
 
 // Mean per-pixel chroma (colour strength) of one zone. Optically variable ink
-// is strongly coloured at some viewing angles; the counterfeit's equivalent
+// is strongly coloured at any viewing angle; the counterfeit's equivalent
 // patches came back grey, which is what this measures.
 function zoneChroma(img: tf.Tensor3D, denom: number | null, zone: Rect): number {
   const z   = tf.image.resizeBilinear(cropToNote(img, denom, zone), [96, 96]).toFloat().div(255);
@@ -315,6 +325,7 @@ function analyzePhase1Frame(raw: Uint8Array, denomination: number | null) {
 
     // ── Rolling colour: is the OVI patch actually coloured? ──
     const oviChroma = zoneChroma(img, denomination, z.rolling);
+    const oviHue    = zoneHue(img, denomination, z.rolling);
 
     console.log(`[P1] noteHue=${noteHue.toFixed(1)}° sat=${saturation.toFixed(2)} oviChroma=${oviChroma.toFixed(4)} winVar=${winVar.toFixed(4)} win/body=${winLuma.toFixed(3)}/${bodyLuma.toFixed(3)} ratio=${(bodyLuma > 0 ? winLuma / bodyLuma : 0).toFixed(3)}`);
     return { colorTone, oviChroma, winVar, winLuma, bodyLuma };
@@ -369,7 +380,7 @@ async function readReversedNumeral(
 
   try {
     const crop = cropFor(denom);
-    const band = zonesFor(denom).reverse;
+    const band = zonesFor(denom).numeral;
     // Compose the note crop with the band inside it, in absolute pixels
     const noteX = crop.x0 * width;
     const noteY = crop.y0 * height;
@@ -383,7 +394,9 @@ async function readReversedNumeral(
     };
 
     const readDigits = async (flip: boolean) => {
-      const ops: any[] = [{ crop: region }];
+      // Upscale: ML Kit needs the digit at a workable size, and the crop is a
+      // small slice of the frame.
+      const ops: any[] = [{ crop: region }, { resize: { width: 800 } }];
       if (flip) ops.push({ flip: ImageManipulator.FlipType.Horizontal });
       const out = await ImageManipulator.manipulateAsync(uri, ops, {
         format: ImageManipulator.SaveFormat.JPEG, compress: 0.9,
@@ -487,6 +500,7 @@ export function CameraScreen() {
     bestW: 0,
     bestH: 0,
     reversedOk: false,
+    reverseSawText: false,
     bumpPattern: false,
     dynamicImage3d: false,
   });
@@ -585,10 +599,12 @@ export function CameraScreen() {
     const mlDenom  = LABEL_TO_DENOM[topLabel] ?? null;
     console.log(`[ML] ${topLabel}=${topScore.toFixed(3)} denom=${mlDenom}`);
 
-    // Denomination identification only — this model cannot detect fakes.
+    // Always track the best banknote-detection confidence, even when OCR
+    // already supplied the denomination — this feeds the final verdict.
     if (mlDenom && topScore > p1.current.mlScore) {
       p1.current.mlScore = topScore;
     }
+    // Only ML sets the denomination when OCR hasn't found one
     if (topScore >= DENOM_THRESHOLD && mlDenom && !p1.current.denomination) {
       p1.current.denomination = mlDenom;
       setDenom(mlDenom);
@@ -601,7 +617,7 @@ export function CameraScreen() {
     startBirdPhase();
   };
 
-  // ─── STEP 2: Flying Bird (torch on, rock the note) ───────────────────────
+  // ─── STEP 2: Flying Bird (torch on, tilt all directions) ─────────────────
   const startBirdPhase = () => {
     setPhase("bird");
     setProgress(0);
@@ -615,6 +631,7 @@ export function CameraScreen() {
       const done = birdBrightness.current.length;
       setProgress(Math.min(done / TARGET_FRAMES, 1));
 
+      // Finish once every direction has contributed a frame
       if (done >= TARGET_FRAMES || Date.now() - startTime >= PHASE_TIMEOUT) {
         stopInterval();
         setTorchOn(false);
@@ -646,9 +663,9 @@ export function CameraScreen() {
   const finalizeBird = () => {
     const vals = birdBrightness.current;
     const bVar = range(vals);
-    // Genuine note: torch light catches the shadow/OVI bird image → brightness
-    // varies as the note rocks (measured 0.1018 and 0.1084). A flat printed
-    // image stays uniform under the torch (measured 0.0542).
+    // Genuine note: torch light catches the shadow/OVI bird image → brightness varies
+    // Fake note: flat printed image → brightness stays uniform under torch.
+    // With too few frames there was no real tilt to measure, so don't fail on it.
     const flyingBird = vals.length >= 2 && bVar < TH_BIRD_VARIANCE;
     console.log(`[Bird Final] frames=${vals.length} var=${bVar.toFixed(4)} fail=${flyingBird}`);
     updateCheck("Flying Bird", flyingBird ? "fail" : "pass");
@@ -782,7 +799,8 @@ export function CameraScreen() {
       const r = await readReversedNumeral(
         p2.current.bestUri, p2.current.bestW, p2.current.bestH, p1.current.denomination,
       );
-      p2.current.reversedOk = r.reversedOk;
+      p2.current.reversedOk     = r.reversedOk;
+      p2.current.reverseSawText = !!(r.plain || r.mirrored);
     }
 
     // Dynamic movement — same peak-and-swing test as rolling colour
@@ -821,8 +839,11 @@ export function CameraScreen() {
     // The mirrored numeral is a discrete reading rather than a threshold, so a
     // clean result is strong evidence either way. It is only counted when the
     // read succeeded at all — a silent OCR failure must not condemn a note.
-    const reverseTried = !!p2.current.bestUri && !!p1.current.denomination;
-    const reverseFail  = reverseTried && !p2.current.reversedOk;
+    // Only counts when OCR actually read something. Two empty readings mean
+    // the crop missed the numeral or could not resolve it — that is a failure
+    // of the check, not evidence against the note, and must not be scored.
+    const reverseRead = !!p2.current.reverseSawText;
+    const reverseFail = reverseRead && !p2.current.reversedOk;
 
     const score =
       (flyingBirdFail  ? 0.30 : 0) +  // stable across repeat scans
@@ -855,7 +876,7 @@ export function CameraScreen() {
       `  6 Dynamic Move  : ${mark(dynamicMovement)}\n` +
       `  7 3D Image      : ${mark(dynamicImage3d)}\n` +
       `  8 Bump Patterns : ${mark(bumpPattern)}\n` +
-      `  9 Reversed "${p1.current.denomination ?? "?"}"  : ${reverseTried ? mark(reverseFail) : "not read"}\n` +
+      `  9 Reversed "${p1.current.denomination ?? "?"}"  : ${reverseRead ? mark(reverseFail) : "NOT READ — check not working"}\n` +
       `  ─────────────────────\n` +
       `  Risk score      : ${score.toFixed(2)} / 1.00  (fail above 0.40)\n` +
       `  ML denom conf   : ${p1.current.mlScore.toFixed(3)}  (identification only)\n` +
@@ -1294,7 +1315,7 @@ const styles = StyleSheet.create({
   readoutOk:      { color: "#4ADE80", fontSize: 9, fontWeight: "900", letterSpacing: 2, marginBottom: 7 },
   readoutValue:   { color: "#fff", fontSize: 24, fontWeight: "700", fontFamily: "monospace", letterSpacing: 2 },
 
-  // ── Rocking motion indicator ──
+  // ── D-pad ──
   rockTrack: {
     flexDirection: "row", alignItems: "center", justifyContent: "center",
     alignSelf: "center", gap: 14, height: 40,
