@@ -9,13 +9,18 @@ import type { RootStackParamList } from '../navigation/types';
 
 type Route = RouteProp<RootStackParamList, 'Verdict'>;
 
+// Ordered to match the console scan report, so the screen and the log always
+// tell the same story. Every check that contributes to the risk score has a
+// row here — omitting one made the header count disagree with the list.
 const SECURITY_FEATURES: { label: string; check: keyof NonNullable<Route['params']['pixelChecks']> | null }[] = [
+  { label: 'Flying Bird',                   check: 'flyingBird' },
   { label: 'Color Tone',                    check: 'colorTone' },
   { label: 'Clear Window (×2)',             check: 'clearWindow' },
+  { label: 'Rolling Colour Effect (×3)',    check: 'rollingColour' },
   { label: 'Dynamic Movement (Bird/No.)',   check: 'dynamicMovement' },
   { label: '3D Dynamic Image',              check: 'dynamicImage3d' },
-  { label: 'Rolling Colour Effect (×3)',    check: 'rollingColour' },
   { label: 'Bump Patterns (Intaglio)',      check: 'bumpPattern' },
+  { label: 'Reversing Numeral',             check: 'reversedNumeral' },
 ];
 
 
@@ -34,8 +39,19 @@ export function VerdictScreen() {
   const { status = 'REVIEW', serialNumber, denomination, pixelChecks } = route.params ?? {};  const isPass = status === 'PASS';
   const didHaptic = useRef(false);
 
-  const failedCount = isPass ? 0 : SECURITY_FEATURES.length;
-  const passedCount = isPass ? SECURITY_FEATURES.length : 0;
+  // A pixelChecks flag is true when the check FAILED; null means it could not
+  // be run. Rows and the header count both read from this one function, so the
+  // headline can no longer claim a number the list does not show.
+  const rowStatus = (check: typeof SECURITY_FEATURES[number]['check']): 'pass' | 'fail' | 'unknown' => {
+    if (!check || !pixelChecks) return isPass ? 'pass' : 'fail';
+    const failed = pixelChecks[check];
+    if (failed === null || failed === undefined) return 'unknown';
+    return failed ? 'fail' : 'pass';
+  };
+
+  const statuses    = SECURITY_FEATURES.map(f => rowStatus(f.check));
+  const failedCount = statuses.filter(s => s === 'fail').length;
+  const passedCount = statuses.filter(s => s === 'pass').length;
 
   useEffect(() => {
     if (didHaptic.current) return;
@@ -101,12 +117,16 @@ export function VerdictScreen() {
         <View style={styles.auditCard}>
           <Text style={styles.auditTitle}>SECURITY FEATURE AUDIT</Text>
           {SECURITY_FEATURES.map((feature, i) => {
-              const pass = feature.check && pixelChecks ? !pixelChecks[feature.check] : isPass;
+              const status = statuses[i];
+              const color =
+                status === 'pass' ? Theme.colors.green :
+                status === 'fail' ? Theme.colors.amber :
+                Theme.colors.textMid;
               return (
                 <View key={feature.label} style={[styles.featureRow, i > 0 && styles.featureRowBorder]}>
                   <Text style={styles.featureName}>{feature.label}</Text>
-                  <Text style={[styles.featureBadge, { color: pass ? Theme.colors.green : Theme.colors.amber }]}>
-                    {pass ? 'PASS' : 'FAIL'}
+                  <Text style={[styles.featureBadge, { color }]}>
+                    {status === 'pass' ? 'PASS' : status === 'fail' ? 'FAIL' : 'NOT READ'}
                   </Text>
                 </View>
               );

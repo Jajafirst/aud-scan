@@ -904,7 +904,13 @@ export function CameraScreen() {
       serialNumber: p1.current.serialNumber,
       denomination: p1.current.denomination ?? undefined,
       confidence:   p1.current.mlScore,
-      pixelChecks:  { colorTone, clearWindow, dynamicMovement, dynamicImage3d, rollingColour, bumpPattern },
+      // Every check the console report lists, so the result screen and the log
+      // can never disagree. reversedNumeral is null when OCR read nothing.
+      pixelChecks:  {
+        colorTone, clearWindow, dynamicMovement, dynamicImage3d, rollingColour, bumpPattern,
+        flyingBird: flyingBirdFail,
+        reversedNumeral: reverseRead ? reverseFail : null,
+      },
     });
   };
 
