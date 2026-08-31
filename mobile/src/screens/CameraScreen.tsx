@@ -67,6 +67,20 @@ const TH_BIRD_RATIO_SWING = 0.10;
 // no matched-pair measurement exists yet, so this is a starting point to be
 // replaced by the first genuine/fake reading.
 const TH_NUMERAL_PATTERN_DIFF = 0.45;
+// Colour SWING across the rock — how much the optically variable features
+// change as the angle changes. Measured on a matched pair scanned back to back
+// under the same lamp with the current two-position protocol:
+//
+//                 genuine $5   fake $5    ratio
+//   front swing     0.0566     0.0060      9.4x
+//   back swing      0.0150     0.0062      2.4x
+//
+// The front gap is wide and the direction was predicted from the physics
+// before the data was taken: real optically variable ink shifts with angle,
+// a printed imitation of it cannot. The back gap is real but narrow, so the
+// back carries less weight in the score than the front.
+const TH_OVI_SWING_FRONT = 0.025;  // between fake 0.0060 and genuine 0.0566
+const TH_OVI_SWING_BACK  = 0.010;  // between fake 0.0062 and genuine 0.0150
 const TH_SHARPNESS_MIN   = 0.013;  // below genuine B 0.0207, above fake 0.0095
 const TH_DETAIL_MIN      = 0.012;  // genuine B 0.0202 vs fake 0.0197 — weak
 // Single-frame window variance is kept only for the log — it does not
@@ -430,15 +444,49 @@ function analyzePhase2Frame(raw: Uint8Array, denom: number | null) {
 // A genuine note swaps between "5" and a mirrored "5" as the light direction
 // changes, which is a large structural difference. A printed dome holds one
 // picture at every angle, so every pair looks nearly identical.
+// Comparing the patches where they sit does not work: the note is handheld,
+// so the fixed-fraction crop lands on a slightly different part of it each
+// frame, and the resulting difference is the crop moving rather than the dome
+// changing. Measured on the counterfeit it returned 0.9345 — roughly what two
+// unrelated images score — from a flat print that cannot change shape at all.
+//
+// So slide one patch over the other and keep the BEST match. Whatever
+// difference survives the best possible alignment is a real change of pattern,
+// not drift. SEARCH is in patch pixels: at 48x48 over a band a few centimetres
+// wide, +/-6 covers roughly a centimetre of hand movement.
+const PATCH_N      = 48;
+const PATCH_SEARCH = 6;
+
+function alignedDifference(a: number[], b: number[]): number {
+  let best = Infinity;
+  for (let dy = -PATCH_SEARCH; dy <= PATCH_SEARCH; dy++) {
+    for (let dx = -PATCH_SEARCH; dx <= PATCH_SEARCH; dx++) {
+      let sum = 0, n = 0;
+      for (let y = 0; y < PATCH_N; y++) {
+        const sy = y + dy;
+        if (sy < 0 || sy >= PATCH_N) continue;
+        for (let x = 0; x < PATCH_N; x++) {
+          const sx = x + dx;
+          if (sx < 0 || sx >= PATCH_N) continue;
+          sum += Math.abs(a[y * PATCH_N + x] - b[sy * PATCH_N + sx]);
+          n++;
+        }
+      }
+      // Ignore offsets where the patches barely overlap — a sliver can match
+      // by accident and would report a spuriously good alignment.
+      if (n > PATCH_N * PATCH_N * 0.5) best = Math.min(best, sum / n);
+    }
+  }
+  return best === Infinity ? 0 : best;
+}
+
 function maxPatchDifference(patches: number[][]): number {
   let worst = 0;
   for (let i = 0; i < patches.length; i++) {
     for (let j = i + 1; j < patches.length; j++) {
       const a = patches[i], b = patches[j];
-      if (a.length !== b.length || !a.length) continue;
-      let sum = 0;
-      for (let k = 0; k < a.length; k++) sum += Math.abs(a[k] - b[k]);
-      worst = Math.max(worst, sum / a.length);
+      if (a.length !== PATCH_N * PATCH_N || b.length !== a.length) continue;
+      worst = Math.max(worst, alignedDifference(a, b));
     }
   }
   return worst;
@@ -872,8 +920,12 @@ export function CameraScreen() {
     // angle, or visibly swing between angles. Printed ink does neither.
     const chromaPeak  = oviChromas.length ? Math.max(...oviChromas) : 0;
     const chromaSwing = range(oviChromas);
-    const rollingColour = oviChromas.length > 0 &&
-      chromaPeak < TH_OVI_CHROMA_PEAK && chromaSwing < TH_OVI_CHROMA_SWING;
+    // Optically variable ink CHANGES colour as the angle changes; flat printed
+    // ink is whatever colour it is at every angle. So the discriminator is the
+    // swing, not the peak. Requiring a low peak as well was what let the fake
+    // through: its dome is a saturated print, so peak 0.1351 cleared the bar
+    // while its swing was 0.0060 against the genuine note's 0.0566.
+    const rollingColour = oviChromas.length >= 2 && chromaSwing < TH_OVI_SWING_FRONT;
 
     p1.current.colorTone     = colorTone;
     p1.current.clearWindow   = clearWindow;
@@ -956,8 +1008,9 @@ export function CameraScreen() {
     // Dynamic movement — same peak-and-swing test as rolling colour
     const chromaPeak      = oviChromas.length ? Math.max(...oviChromas) : 0;
     const chromaSwing     = range(oviChromas);
-    const dynamicMovement = oviChromas.length > 0 &&
-      chromaPeak < TH_OVI_CHROMA_PEAK && chromaSwing < TH_OVI_CHROMA_SWING;
+    // Same reasoning as rolling colour: a feature that does not change with
+    // angle is not an optically variable feature, whatever colour it is.
+    const dynamicMovement = oviChromas.length >= 2 && chromaSwing < TH_OVI_SWING_BACK;
 
     // Median so a single motion-blurred frame can't flip either check.
     // Both of these measure high-frequency content, and the genuine note has
@@ -995,13 +1048,17 @@ export function CameraScreen() {
     const reverseRead = !!p2.current.reverseSawText;
     const reverseFail = reverseRead && !p2.current.reversedOk;
 
+    // Weighted by how cleanly each measure separated the matched pair scanned
+    // back to back under one lamp. Colour swing on the front is the widest gap
+    // this project has measured (9.4x) and the only one whose direction was
+    // predicted from the physics before the data existed, so it leads.
     const score =
-      (flyingBirdFail  ? 0.15 : 0) +  // differential, but threshold uncalibrated
-      (reverseFail     ? 0.25 : 0) +  // discrete, lighting-independent
-      (bumpPattern     ? 0.20 : 0) +  // separates, but narrowly
-      (dynamicMovement ? 0.15 : 0) +
-      (rollingColour   ? 0.15 : 0) +
-      (colorTone       ? 0.10 : 0) +
+      (rollingColour   ? 0.40 : 0) +  // front colour swing — 0.0566 vs 0.0060
+      (dynamicMovement ? 0.20 : 0) +  // back colour swing — 0.0150 vs 0.0062
+      (bumpPattern     ? 0.20 : 0) +  // sharpness — 0.0535 vs 0.0152
+      (flyingBirdFail  ? 0.10 : 0) +  // confounded by hand movement, see below
+      (colorTone       ? 0.05 : 0) +
+      (reverseFail     ? 0.05 : 0) +  // pattern test still uncalibrated
       (dynamicImage3d  ? 0.05 : 0) +  // unreliable — token weight only
       (clearWindow     ? 0.05 : 0);   // unreliable — token weight only
 
