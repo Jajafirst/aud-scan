@@ -48,7 +48,16 @@ const SETTLE_MS       = 1600;
 // Chroma is read separately per side. The front numeral measured 0.0946 and
 // the back only 0.0272 on the genuine note, so a single shared threshold (the
 // earlier 0.09, which was a guess) failed the back of a real note every time.
+// Absolute window brightness — retired as a verdict. Kept only so the raw line
+// in the report stays comparable with earlier scans. It measured torch
+// distance, not the note: the same counterfeit gave 0.0698 and 0.0957 on
+// consecutive scans, landing either side of this threshold on hand movement.
 const TH_BIRD_VARIANCE   = 0.070;  // between fake 0.0542 and genuine 0.10+
+// The live bird check: how much the window/reference luminance RATIO swings
+// across the rock. UNCALIBRATED — there is no genuine-$5 ratio measurement
+// yet, so this number is a placeholder, not evidence. The bird's weight in the
+// score is reduced accordingly until a matched pair fixes it.
+const TH_BIRD_RATIO_SWING = 0.10;
 const TH_SHARPNESS_MIN   = 0.013;  // below genuine B 0.0207, above fake 0.0095
 const TH_DETAIL_MIN      = 0.012;  // genuine B 0.0202 vs fake 0.0197 — weak
 // Single-frame window variance is kept only for the log — it does not
@@ -275,15 +284,38 @@ function zoneChroma(img: tf.Tensor3D, denom: number | null, zone: Rect): number 
   return max.sub(min).mean().dataSync()[0];
 }
 
-// Flying bird sits in the clear window — measure only there, under torch
-function analyzeBirdFrame(raw: Uint8Array, denom: number | null): { brightness: number } {
+// Flying bird sits in the clear window — measure only there, under torch.
+//
+// Absolute brightness of the window was the original measure and it does not
+// work: it tracks how near the torch is and what angle the hand is at, not the
+// note. The same counterfeit gave 0.0698 on one scan and 0.0957 on the next,
+// straddling the threshold, because the two runs were rocked differently.
+//
+// Three quantities are returned instead, all measured per frame:
+//
+//   brightness — the old absolute value, kept only so past logs stay readable
+//   ratio      — window luminance divided by the plain-print reference zone.
+//                Moving the phone changes both zones together, so the ratio
+//                holds still under hand movement and only responds to light
+//                genuinely behaving differently inside the window.
+//   variance   — how much structure the window carries. The bird is an image
+//                that appears and vanishes with angle, so on a genuine note
+//                this should rise and fall; a flat print keeps whatever
+//                structure it has at every angle.
+function analyzeBirdFrame(raw: Uint8Array, denom: number | null): {
+  brightness: number; ratio: number; variance: number;
+} {
   return tf.tidy(() => {
-    const img     = decodeJpeg(raw, 3);
-    const zone    = cropToNote(img, denom, zonesFor(denom).window);
-    const resized = tf.image.resizeBilinear(zone, [128, 128]);
-    const brightness = resized.toFloat().div(255).mean().dataSync()[0];
-    console.log(`[Bird] brightness=${brightness.toFixed(4)}`);
-    return { brightness };
+    const img  = decodeJpeg(raw, 3);
+    const z    = zonesFor(denom);
+    const win  = meanLuma(img, denom, z.window);
+    const ref  = meanLuma(img, denom, z.ref);
+    const brightness = tf.image.resizeBilinear(cropToNote(img, denom, z.window), [128, 128])
+      .toFloat().div(255).mean().dataSync()[0];
+    const ratio    = ref > 0.01 ? win / ref : 0;
+    const variance = zoneVariance(img, denom, z.window);
+    console.log(`[Bird] brightness=${brightness.toFixed(4)} win/ref=${win.toFixed(3)}/${ref.toFixed(3)} ratio=${ratio.toFixed(4)} var=${variance.toFixed(4)}`);
+    return { brightness, ratio, variance };
   });
 }
 
@@ -380,42 +412,62 @@ async function readReversedNumeral(
 
   try {
     const crop = cropFor(denom);
-    const band = zonesFor(denom).numeral;
-    // Compose the note crop with the band inside it, in absolute pixels
     const noteX = crop.x0 * width;
     const noteY = crop.y0 * height;
     const noteW = (crop.x1 - crop.x0) * width;
     const noteH = (crop.y1 - crop.y0) * height;
-    const region = {
+
+    const toRegion = (band: Rect) => ({
       originX: Math.max(0, Math.round(noteX + band.x0 * noteW)),
       originY: Math.max(0, Math.round(noteY + band.y0 * noteH)),
       width:   Math.max(1, Math.round((band.x1 - band.x0) * noteW)),
       height:  Math.max(1, Math.round((band.y1 - band.y0) * noteH)),
-    };
+    });
 
-    const readDigits = async (flip: boolean) => {
-      // Upscale: ML Kit needs the digit at a workable size, and the crop is a
-      // small slice of the frame.
-      const ops: any[] = [{ crop: region }, { resize: { width: 800 } }];
+    const readDigits = async (band: Rect, flip: boolean) => {
+      // Upscale hard. ML Kit needs a digit tens of pixels tall; this band is a
+      // small slice of an already-cropped frame, and at the previous 800px the
+      // numeral was still too small to resolve — every read came back empty.
+      const ops: any[] = [{ crop: toRegion(band) }, { resize: { width: 1400 } }];
       if (flip) ops.push({ flip: ImageManipulator.FlipType.Horizontal });
       const out = await ImageManipulator.manipulateAsync(uri, ops, {
-        format: ImageManipulator.SaveFormat.JPEG, compress: 0.9,
+        format: ImageManipulator.SaveFormat.JPEG, compress: 1.0,
       });
       const ocr = await withTimeout(TextRecognition.recognize(out.uri), 3000);
       if (!ocr) return "";
       return (ocr as any).blocks.map((b: any) => b.text).join(" ").replace(/\s+/g, " ").trim();
     };
 
-    const plain    = await readDigits(false);
-    const mirrored = await readDigits(true);
+    // One guessed rectangle was the whole problem: when the guess missed, OCR
+    // returned nothing and the log said only that the check had failed, which
+    // taught us nothing about WHERE the numeral actually is. Sweep a few
+    // plausible bands along the window strip instead, log every attempt, and
+    // take the first that reads. The log then names the band that worked, so
+    // the zone can be fixed properly rather than guessed at again.
+    const zn = zonesFor(denom);
+    const candidates: { name: string; band: Rect }[] = [
+      { name: "numeral", band: zn.numeral },
+      { name: "win-top", band: { x0: 0.06, y0: 0.36, x1: 0.50, y1: 0.54 } },
+      { name: "win-bot", band: { x0: 0.06, y0: 0.54, x1: 0.50, y1: 0.72 } },
+      { name: "win-all", band: { x0: 0.04, y0: 0.34, x1: 0.56, y1: 0.74 } },
+    ];
 
-    const wanted     = String(denom);
+    const wanted = String(denom);
+    let plain = "", mirrored = "", hitBand = "";
+
+    for (const c of candidates) {
+      const p = await readDigits(c.band, false);
+      const m = await readDigits(c.band, true);
+      console.log(`[Reverse] band=${c.name} plain="${p}" mirrored="${m}"`);
+      if (p || m) { plain = p; mirrored = m; hitBand = c.name; break; }
+    }
+
     const inPlain    = plain.includes(wanted);
     const inMirrored = mirrored.includes(wanted);
     // Only the mirrored reading should find the numeral
     const reversedOk = inMirrored && !inPlain;
 
-    console.log(`[Reverse] want="${wanted}" plain="${plain}" mirrored="${mirrored}" → reversedOk=${reversedOk}`);
+    console.log(`[Reverse] want="${wanted}" band=${hitBand || "NONE READ"} plain="${plain}" mirrored="${mirrored}" → reversedOk=${reversedOk}`);
     return { plain, mirrored, reversedOk };
   } catch (e: any) {
     console.log("[Reverse] failed:", e?.message);
@@ -505,6 +557,8 @@ export function CameraScreen() {
     dynamicImage3d: false,
   });
   const birdBrightness = useRef<number[]>([]);
+  const birdRatio      = useRef<number[]>([]);
+  const birdVariance   = useRef<number[]>([]);
   const busyRef = useRef(false);
   const settleUntilRef = useRef(0);
   const [settling, setSettling] = useState(false);
@@ -621,6 +675,11 @@ export function CameraScreen() {
   const startBirdPhase = () => {
     setPhase("bird");
     setProgress(0);
+    // Clear last scan's samples — these refs outlive a single scan, so without
+    // this a second scan without remounting would average in the first note.
+    birdBrightness.current = [];
+    birdRatio.current      = [];
+    birdVariance.current   = [];
     setTorchOn(true);
     startRock();
     beginSettle();
@@ -652,8 +711,10 @@ export function CameraScreen() {
         });
         if (!photo?.base64) return;
         const raw = Uint8Array.from(atob(photo.base64), c => c.charCodeAt(0));
-        const { brightness } = analyzeBirdFrame(raw, p1.current.denomination);
-        birdBrightness.current.push(brightness);
+        const b = analyzeBirdFrame(raw, p1.current.denomination);
+        birdBrightness.current.push(b.brightness);
+        birdRatio.current.push(b.ratio);
+        birdVariance.current.push(b.variance);
         runMlDenomination(raw);
         beginSettle();
       } catch {} finally { busyRef.current = false; }
@@ -661,13 +722,26 @@ export function CameraScreen() {
   };
 
   const finalizeBird = () => {
-    const vals = birdBrightness.current;
-    const bVar = range(vals);
-    // Genuine note: torch light catches the shadow/OVI bird image → brightness varies
-    // Fake note: flat printed image → brightness stays uniform under torch.
-    // With too few frames there was no real tilt to measure, so don't fail on it.
-    const flyingBird = vals.length >= 2 && bVar < TH_BIRD_VARIANCE;
-    console.log(`[Bird Final] frames=${vals.length} var=${bVar.toFixed(4)} fail=${flyingBird}`);
+    const vals       = birdBrightness.current;
+    const bVar       = range(vals);              // absolute — kept for the log only
+    const ratioSwing = range(birdRatio.current); // differential — the verdict
+    const varSwing   = range(birdVariance.current);
+
+    // The verdict rests on ratioSwing, not on absolute brightness. A genuine
+    // window changes how it carries light as the note rocks, and dividing by
+    // the plain-print reference removes the hand movement that made the old
+    // absolute measure flip the same note either side of its threshold.
+    //
+    // TH_BIRD_RATIO_SWING is NOT yet calibrated against a genuine note — there
+    // is no genuine-$5 ratio data at all. Until there is, the bird cannot be
+    // allowed to carry a verdict on its own, so its weight is cut in the score
+    // and both other measures are logged for comparison. Whichever of the
+    // three actually separates a matched pair becomes the real check.
+    const flyingBird = birdRatio.current.length >= 2 && ratioSwing < TH_BIRD_RATIO_SWING;
+    console.log(
+      `[Bird Final] frames=${vals.length} ratioSwing=${ratioSwing.toFixed(4)} ` +
+      `varSwing=${varSwing.toFixed(4)} absVar=${bVar.toFixed(4)} fail=${flyingBird}`,
+    );
     updateCheck("Flying Bird", flyingBird ? "fail" : "pass");
     startPhase1();
   };
@@ -846,7 +920,7 @@ export function CameraScreen() {
     const reverseFail = reverseRead && !p2.current.reversedOk;
 
     const score =
-      (flyingBirdFail  ? 0.30 : 0) +  // stable across repeat scans
+      (flyingBirdFail  ? 0.15 : 0) +  // differential, but threshold uncalibrated
       (reverseFail     ? 0.25 : 0) +  // discrete, lighting-independent
       (bumpPattern     ? 0.20 : 0) +  // separates, but narrowly
       (dynamicMovement ? 0.15 : 0) +
@@ -882,7 +956,9 @@ export function CameraScreen() {
       `  ML denom conf   : ${p1.current.mlScore.toFixed(3)}  (identification only)\n` +
       `  VERDICT         : ${verdict}\n` +
       `═════════════════════════\n` +
-      `  raw: birdVar=${range(birdBrightness.current).toFixed(4)}(n=${birdBrightness.current.length}) ` +
+      `  raw: birdRatioSwing=${range(birdRatio.current).toFixed(4)} ` +
+      `birdVarSwing=${range(birdVariance.current).toFixed(4)} ` +
+      `birdVar=${range(birdBrightness.current).toFixed(4)}(n=${birdBrightness.current.length}) ` +
       `p1Peak=${p1.current.oviChromas.length ? Math.max(...p1.current.oviChromas).toFixed(4) : "0"}(n=${p1.current.oviChromas.length}) ` +
       `p1Swing=${range(p1.current.oviChromas).toFixed(4)} ` +
       `winRatioSwing=${range(p1.current.winRatios).toFixed(4)} ` +
