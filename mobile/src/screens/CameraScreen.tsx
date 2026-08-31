@@ -58,6 +58,11 @@ const TH_BIRD_VARIANCE   = 0.070;  // between fake 0.0542 and genuine 0.10+
 // yet, so this number is a placeholder, not evidence. The bird's weight in the
 // score is reduced accordingly until a matched pair fixes it.
 const TH_BIRD_RATIO_SWING = 0.10;
+// Reversing numeral: how much the dome's contrast-normalised pattern must
+// change across the tilt before the feature counts as present. UNCALIBRATED —
+// no matched-pair measurement exists yet, so this is a starting point to be
+// replaced by the first genuine/fake reading.
+const TH_NUMERAL_PATTERN_DIFF = 0.45;
 const TH_SHARPNESS_MIN   = 0.013;  // below genuine B 0.0207, above fake 0.0095
 const TH_DETAIL_MIN      = 0.012;  // genuine B 0.0202 vs fake 0.0197 — weak
 // Single-frame window variance is kept only for the log — it does not
@@ -389,9 +394,46 @@ function analyzePhase2Frame(raw: Uint8Array, denom: number | null) {
     const oviChroma = zoneChroma(img, denom, z.reverse);
     const oviHue    = zoneHue(img, denom, z.reverse);
 
+    // ── Reversing numeral: the shape of the dome under this lighting ──
+    // Photographs of a genuine $5 lit from the left show a "5"; lit from the
+    // right the same dome shows a MIRRORED "5". The feature is a change of
+    // shape with the direction light rakes across it.
+    //
+    // Contrast-normalised so the comparison is of PATTERN, not brightness: a
+    // flat print lit from two sides gives the same picture at two exposures,
+    // and without normalising, that exposure difference alone would look like
+    // a change of shape.
+    const patch = tf.image.resizeBilinear(cropToNote(img, denom, z.numeral), [48, 48]).toFloat();
+    const pg    = patch.slice([0, 0, 0], [-1, -1, 1]).mul(0.299)
+      .add(patch.slice([0, 0, 1], [-1, -1, 1]).mul(0.587))
+      .add(patch.slice([0, 0, 2], [-1, -1, 1]).mul(0.114)).div(255);
+    const pMean = pg.mean();
+    const pStd  = pg.sub(pMean).square().mean().sqrt();
+    const norm  = pg.sub(pMean).div(pStd.add(1e-4));
+    const numeralPatch = Array.from(norm.dataSync());
+
     console.log(`[P2] sharp=${sharpness.toFixed(5)} detail=${noiseMean.toFixed(5)} oviChroma=${oviChroma.toFixed(4)} oviHue=${oviHue.toFixed(1)}°`);
-    return { sharpness, detail: noiseMean, oviChroma };
+    return { sharpness, detail: noiseMean, oviChroma, numeralPatch };
   });
+}
+
+// Largest pattern difference between any two captures of the numeral dome.
+// Each patch is already contrast-normalised, so this compares shape alone.
+// A genuine note swaps between "5" and a mirrored "5" as the light direction
+// changes, which is a large structural difference. A printed dome holds one
+// picture at every angle, so every pair looks nearly identical.
+function maxPatchDifference(patches: number[][]): number {
+  let worst = 0;
+  for (let i = 0; i < patches.length; i++) {
+    for (let j = i + 1; j < patches.length; j++) {
+      const a = patches[i], b = patches[j];
+      if (a.length !== b.length || !a.length) continue;
+      let sum = 0;
+      for (let k = 0; k < a.length; k++) sum += Math.abs(a[k] - b[k]);
+      worst = Math.max(worst, sum / a.length);
+    }
+  }
+  return worst;
 }
 
 // The reversing numeral reads BACKWARDS on a genuine note — photographs of a
@@ -545,6 +587,7 @@ export function CameraScreen() {
     oviChromas: [] as number[],
     sharpnesses: [] as number[],
     details: [] as number[],
+    numeralPatches: [] as number[][],
     // The frame whose OVI band was most vivid — the numeral is most likely to
     // be fully formed there, so the mirrored-numeral read is done on it.
     bestUri: "" as string,
@@ -853,6 +896,7 @@ export function CameraScreen() {
         p2.current.oviChromas.push(f.oviChroma);
         p2.current.sharpnesses.push(f.sharpness);
         p2.current.details.push(f.detail);
+        p2.current.numeralPatches.push(f.numeralPatch);
         if (photo.uri && f.oviChroma > p2.current.bestChroma) {
           p2.current.bestChroma = f.oviChroma;
           p2.current.bestUri    = photo.uri;
@@ -868,13 +912,24 @@ export function CameraScreen() {
   const finalizePhase2 = async () => {
     const { oviChromas, sharpnesses, details } = p2.current;
 
-    // Mirrored-numeral read on the most vivid frame
+    // ── Reversing numeral ──
+    // The genuine feature swaps between "5" and a mirrored "5" depending on
+    // which side light rakes across the dome, so the test is whether the dome's
+    // PATTERN changes across the tilt. Text recognition is not used: the dome
+    // is holographic and low-contrast, and OCR returned nothing from any of
+    // four candidate crops at 1400px, on both the genuine note and the fake.
+    const numeralDiff = maxPatchDifference(p2.current.numeralPatches);
+    const numeralRead = p2.current.numeralPatches.length >= 2;
+    p2.current.reversedOk     = numeralDiff >= TH_NUMERAL_PATTERN_DIFF;
+    p2.current.reverseSawText = numeralRead;
+    console.log(`[Reverse] frames=${p2.current.numeralPatches.length} patternDiff=${numeralDiff.toFixed(4)} → reversedOk=${p2.current.reversedOk}`);
+
+    // The old text-recognition attempt is kept behind the log only, so the
+    // band sweep can still be inspected while the pattern test is calibrated.
     if (p2.current.bestUri && p2.current.bestW && p2.current.bestH) {
-      const r = await readReversedNumeral(
+      await readReversedNumeral(
         p2.current.bestUri, p2.current.bestW, p2.current.bestH, p1.current.denomination,
       );
-      p2.current.reversedOk     = r.reversedOk;
-      p2.current.reverseSawText = !!(r.plain || r.mirrored);
     }
 
     // Dynamic movement — same peak-and-swing test as rolling colour
@@ -962,7 +1017,7 @@ export function CameraScreen() {
       `p1Peak=${p1.current.oviChromas.length ? Math.max(...p1.current.oviChromas).toFixed(4) : "0"}(n=${p1.current.oviChromas.length}) ` +
       `p1Swing=${range(p1.current.oviChromas).toFixed(4)} ` +
       `winRatioSwing=${range(p1.current.winRatios).toFixed(4)} ` +
-      `p2Peak=${chromaPeak.toFixed(4)} p2Swing=${chromaSwing.toFixed(4)} detail=${detail.toFixed(4)} sharp=${sharpness.toFixed(4)}\n`
+      `numeralDiff=${numeralDiff.toFixed(4)} p2Peak=${chromaPeak.toFixed(4)} p2Swing=${chromaSwing.toFixed(4)} detail=${detail.toFixed(4)} sharp=${sharpness.toFixed(4)}\n`
     );
     triggerHaptic(verdict);
 
