@@ -8,6 +8,7 @@ import { Theme } from "../Theme";
 import { useHistory } from "../contexts/HistoryContext";
 import { useAccessibility } from "../contexts/AccessibilityContext";
 import TextRecognition from "@react-native-ml-kit/text-recognition";
+import * as ImageManipulator from "expo-image-manipulator";
 import * as tf from "@tensorflow/tfjs";
 import { decodeJpeg } from "@tensorflow/tfjs-react-native";
 
@@ -20,8 +21,12 @@ const PASS_THRESHOLD  = 0.80;
 // the user is asked for contributes a sample. PHASE_TIMEOUT only rescues a
 // phase where capture has stalled.
 const TARGET_FRAMES   = 4;     // one per tilt direction
-const PHASE_TIMEOUT   = 25000; // ms — safety net, not the normal exit
-const FRAME_INTERVAL  = 400;   // fires often; a busy guard drops overlapping calls
+const PHASE_TIMEOUT   = 30000; // ms — safety net, not the normal exit
+const FRAME_INTERVAL  = 300;   // fires often; a busy guard drops overlapping calls
+// Grace period after a prompt changes, before the next capture starts. Without
+// it the shutter fired the instant the arrow moved, so every frame caught the
+// note mid-swing between positions instead of held at one.
+const SETTLE_MS       = 1600;
 
 // Feature thresholds, from two scans of genuine $10 AK173948183 and one of
 // counterfeit AK173948185.
@@ -39,16 +44,24 @@ const FRAME_INTERVAL  = 400;   // fires often; a busy guard drops overlapping ca
 // no longer decide anything on their own: they contribute only a small amount
 // of weight, and the verdict rests on the measures that held up across repeat
 // scans of the same note.
-//
-// Chroma is read separately per side. The front numeral measured 0.0946 and
-// the back only 0.0272 on the genuine note, so a single shared threshold (the
-// earlier 0.09, which was a guess) failed the back of a real note every time.
 const TH_BIRD_VARIANCE   = 0.070;  // between fake 0.0542 and genuine 0.10+
 const TH_SHARPNESS_MIN   = 0.013;  // below genuine B 0.0207, above fake 0.0095
 const TH_DETAIL_MIN      = 0.012;  // genuine B 0.0202 vs fake 0.0197 — weak
-const TH_WINDOW_VAR      = 0.015;  // set low: this measure does not separate
-const TH_OVI_CHROMA_FRONT= 0.060;  // genuine 0.0946
-const TH_OVI_CHROMA_BACK = 0.015;  // genuine 0.0272 — needs a fake reading
+// Single-frame window variance is kept only for the log — it does not
+// separate (genuine 0.0514/0.0264 vs fake 0.0369/0.0425, fully overlapping).
+// The live check is now how much the window/body brightness RATIO swings over
+// the tilt. Provisional until scans from both notes are recorded.
+const TH_WINDOW_RATIO_SWING = 0.12;
+// Optically variable ink is dark at most viewing angles and vivid at a few.
+// Photographs of a genuine $5 under raking light show the perched bird running
+// vivid orange-green through to near-black across five tilt angles, and a large
+// multicoloured numeral appearing in the dome on only two of them. Taking the
+// MEDIAN chroma therefore punished the genuine note for behaving correctly,
+// while flat printed ink — steady at every angle — scored a healthier middle
+// value. The checks now look at the PEAK chroma reached at any angle, and at
+// how far chroma swings across the tilt. Flat ink can match neither.
+const TH_OVI_CHROMA_PEAK  = 0.090;  // strongest colour the patch must reach
+const TH_OVI_CHROMA_SWING = 0.035;  // spread between its dullest and brightest
 
 // Median is robust to the one bad frame (motion blur, glare) that a
 // last-frame-wins or mean-based reading would let decide the whole check.
@@ -67,39 +80,100 @@ const LABEL_TO_DENOM: Record<string, number> = {
   "new-5": 5, "new-10": 10, "new-20": 20, "new-50": 50, "new-100": 100,
 };
 
+// Expected dominant hue per denomination, in degrees. These came from the
+// nominal ink colours rather than from measurement, and the one entry that can
+// be checked does not hold: a genuine $10 read between 62 and 106 degrees
+// across scans, nowhere near the 190-240 listed for it. The check only avoids
+// firing constantly because of the saturation gate in analyzePhase1Frame.
+//
+// Camera white balance, ambient colour temperature and the polymer's own sheen
+// all move these, so usable ranges have to be measured through the phone rather
+// than taken from the ink specification. Until that happens colour tone carries
+// the lowest weight of any check and should not be relied on.
 const DENOM_HUE: Record<number, [number, number]> = {
-  5:   [290, 360],
-  10:  [190, 240],
-  20:  [0,   35],
-  50:  [35,  70],
-  100: [90,  150],
+  5:   [290, 360], // unmeasured
+  10:  [190, 240], // unmeasured, and contradicted by scans reading 62-106
+  20:  [0,   35],  // unmeasured
+  50:  [35,  70],  // unmeasured
+  100: [90,  150], // unmeasured
 };
 
-// Note frame geometry — AUD notes are ~2.1:1, held portrait for scanning
+type Rect = { x0: number; y0: number; x1: number; y1: number };
+
+// Note frame geometry. Australian notes share a 65mm height but lengthen with
+// value, so the frame — and therefore every zone crop inside it — has to be
+// sized per denomination. A fixed 2.1 ratio fits the $10 and is roughly 13%
+// too short for a $100, which would drag every crop out of position.
+const NOTE_RATIO: Record<number, number> = {
+  5:   130 / 65,  // 2.00
+  10:  137 / 65,  // 2.11
+  20:  144 / 65,  // 2.22
+  50:  151 / 65,  // 2.32
+  100: 158 / 65,  // 2.43
+};
+const DEFAULT_RATIO = NOTE_RATIO[10];
+
 const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get("window");
 const FRAME_W = SCREEN_W * 0.62;
-const FRAME_H = FRAME_W * 2.1;
+const frameHeightFor = (d: number | null) => FRAME_W * (d ? NOTE_RATIO[d] ?? DEFAULT_RATIO : DEFAULT_RATIO);
 
 // Where the on-screen frame sits, as fractions of the preview. Analysis crops
 // to exactly this rectangle: measuring the whole frame measured the room —
 // desk, hands and ambient light swamped the note and made real and fake alike.
 const FRAME_CENTER_Y = (SCREEN_H - 120) / 2;   // frameWrap has paddingBottom: 120
-const CROP = {
-  x0: (SCREEN_W - FRAME_W) / 2 / SCREEN_W,
-  y0: (FRAME_CENTER_Y - FRAME_H / 2) / SCREEN_H,
-  x1: (SCREEN_W + FRAME_W) / 2 / SCREEN_W,
-  y1: (FRAME_CENTER_Y + FRAME_H / 2) / SCREEN_H,
+const cropFor = (d: number | null) => {
+  const h = frameHeightFor(d);
+  return {
+    x0: (SCREEN_W - FRAME_W) / 2 / SCREEN_W,
+    y0: (FRAME_CENTER_Y - h / 2) / SCREEN_H,
+    x1: (SCREEN_W + FRAME_W) / 2 / SCREEN_W,
+    y1: (FRAME_CENTER_Y + h / 2) / SCREEN_H,
+  };
 };
 
-// Sub-regions within the note, matching the on-screen zone guides
-const ZONE_ROLLING = { x0: 0.06, y0: 0.81, x1: 0.48, y1: 0.95 }; // front, bottom-left "10"
-const ZONE_REVERSE = { x0: 0.06, y0: 0.05, x1: 0.48, y1: 0.19 }; // back, top-left "10"
-const ZONE_WINDOW  = { x0: 0.10, y0: 0.38, x1: 0.90, y1: 0.68 }; // clear polymer window
-// Plain printed area with no optical features — the control for every
-// differential measurement. Whatever happens here is lighting, not security ink.
-const ZONE_REF     = { x0: 0.15, y0: 0.20, x1: 0.85, y1: 0.34 };
+// Sub-regions within the note, as fractions of the note held portrait.
+//
+// The colour-shifting features — Federation star, flying bird, perched bird and
+// the numeral in the dome — all sit INSIDE the clear window strip, which
+// photographs of a genuine $5 under raking light make plain. The OVI zones
+// previously pointed at the printed corner numerals instead, which are ordinary
+// flat ink and shift no colour at all.
+//
+// Both OVI zones now cover the window band generously rather than trying to pin
+// one feature. That is safe because the checks read PEAK chroma: dull
+// surroundings included in the crop cannot pull a maximum down, and whichever
+// feature happens to fire at a given angle is caught.
+interface NoteZones { rolling: Rect; reverse: Rect; window: Rect; ref: Rect }
 
-type Rect = { x0: number; y0: number; x1: number; y1: number };
+// The series shares a design language — window roughly central, optical
+// features inside it — so this layout is the starting point for every note.
+// Each denomination gets its own entry below so a single one can be corrected
+// without disturbing the others.
+const ZONES_SERIES: NoteZones = {
+  // Front and back OVI bands — the window strip plus a little margin
+  rolling: { x0: 0.05, y0: 0.36, x1: 0.95, y1: 0.70 },
+  reverse: { x0: 0.05, y0: 0.36, x1: 0.95, y1: 0.70 },
+  window:  { x0: 0.10, y0: 0.38, x1: 0.90, y1: 0.68 }, // clear polymer window
+  // Plain printed area with no optical features — the control for every
+  // differential measurement. What happens here is lighting, not security ink.
+  ref:     { x0: 0.15, y0: 0.15, x1: 0.85, y1: 0.30 },
+};
+
+// Per-denomination zones. Each note carries a different bird and its features
+// may sit at slightly different heights within the window, so these are kept
+// separate even where the values currently match. To correct one, replace its
+// spread with explicit rectangles — nothing else needs to change.
+//
+// A scan whose p1Peak comes back near zero means the band missed the window on
+// that denomination and its entry needs real measurements.
+const ZONES: Record<number, NoteZones> = {
+  5:   { ...ZONES_SERIES }, // Eastern Spinebill    — unverified
+  10:  { ...ZONES_SERIES }, // checked against a real note
+  20:  { ...ZONES_SERIES }, // Laughing Kookaburra  — unverified
+  50:  { ...ZONES_SERIES }, // Black Swan           — unverified
+  100: { ...ZONES_SERIES }, // Masked Owl           — unverified
+};
+const zonesFor = (d: number | null) => (d && ZONES[d]) || ZONES_SERIES;
 
 // Crop a decoded image to a normalised rectangle
 function cropRect(img: tf.Tensor3D, r: Rect): tf.Tensor3D {
@@ -111,9 +185,10 @@ function cropRect(img: tf.Tensor3D, r: Rect): tf.Tensor3D {
   return img.slice([top, left, 0], [height, width, -1]);
 }
 
-// Crop the camera image down to the note frame, then optionally to a zone inside it
-function cropToNote(img: tf.Tensor3D, zone?: Rect): tf.Tensor3D {
-  const note = cropRect(img, CROP);
+// Crop the camera image to the note frame for this denomination, then
+// optionally to a zone inside it
+function cropToNote(img: tf.Tensor3D, denom: number | null, zone?: Rect): tf.Tensor3D {
+  const note = cropRect(img, cropFor(denom));
   return zone ? cropRect(note, zone) : note;
 }
 
@@ -148,8 +223,8 @@ function getDominantHue(r: tf.Tensor, g: tf.Tensor, b: tf.Tensor): number {
 }
 
 // Mean luminance of one zone of the note
-function meanLuma(img: tf.Tensor3D, zone: Rect): number {
-  const z  = tf.image.resizeBilinear(cropToNote(img, zone), [96, 96]).toFloat();
+function meanLuma(img: tf.Tensor3D, denom: number | null, zone: Rect): number {
+  const z  = tf.image.resizeBilinear(cropToNote(img, denom, zone), [96, 96]).toFloat();
   const r  = z.slice([0, 0, 0], [-1, -1, 1]);
   const g  = z.slice([0, 0, 1], [-1, -1, 1]);
   const b  = z.slice([0, 0, 2], [-1, -1, 1]);
@@ -157,8 +232,8 @@ function meanLuma(img: tf.Tensor3D, zone: Rect): number {
 }
 
 // Dominant hue of one zone of the note
-function zoneHue(img: tf.Tensor3D, zone: Rect): number {
-  const z = tf.image.resizeBilinear(cropToNote(img, zone), [96, 96]).toFloat();
+function zoneHue(img: tf.Tensor3D, denom: number | null, zone: Rect): number {
+  const z = tf.image.resizeBilinear(cropToNote(img, denom, zone), [96, 96]).toFloat();
   return getDominantHue(
     z.slice([0, 0, 0], [-1, -1, 1]),
     z.slice([0, 0, 1], [-1, -1, 1]),
@@ -167,8 +242,8 @@ function zoneHue(img: tf.Tensor3D, zone: Rect): number {
 }
 
 // Luminance variance of one zone — how much visible structure it carries
-function zoneVariance(img: tf.Tensor3D, zone: Rect): number {
-  const z = tf.image.resizeBilinear(cropToNote(img, zone), [96, 96]).toFloat();
+function zoneVariance(img: tf.Tensor3D, denom: number | null, zone: Rect): number {
+  const z = tf.image.resizeBilinear(cropToNote(img, denom, zone), [96, 96]).toFloat();
   const r = z.slice([0, 0, 0], [-1, -1, 1]);
   const g = z.slice([0, 0, 1], [-1, -1, 1]);
   const b = z.slice([0, 0, 2], [-1, -1, 1]);
@@ -178,10 +253,10 @@ function zoneVariance(img: tf.Tensor3D, zone: Rect): number {
 }
 
 // Mean per-pixel chroma (colour strength) of one zone. Optically variable ink
-// is strongly coloured at any viewing angle; the counterfeit's equivalent
+// is strongly coloured at some viewing angles; the counterfeit's equivalent
 // patches came back grey, which is what this measures.
-function zoneChroma(img: tf.Tensor3D, zone: Rect): number {
-  const z   = tf.image.resizeBilinear(cropToNote(img, zone), [96, 96]).toFloat().div(255);
+function zoneChroma(img: tf.Tensor3D, denom: number | null, zone: Rect): number {
+  const z   = tf.image.resizeBilinear(cropToNote(img, denom, zone), [96, 96]).toFloat().div(255);
   const r   = z.slice([0, 0, 0], [-1, -1, 1]);
   const g   = z.slice([0, 0, 1], [-1, -1, 1]);
   const b   = z.slice([0, 0, 2], [-1, -1, 1]);
@@ -191,10 +266,10 @@ function zoneChroma(img: tf.Tensor3D, zone: Rect): number {
 }
 
 // Flying bird sits in the clear window — measure only there, under torch
-function analyzeBirdFrame(raw: Uint8Array): { brightness: number } {
+function analyzeBirdFrame(raw: Uint8Array, denom: number | null): { brightness: number } {
   return tf.tidy(() => {
     const img     = decodeJpeg(raw, 3);
-    const zone    = cropToNote(img, ZONE_WINDOW);
+    const zone    = cropToNote(img, denom, zonesFor(denom).window);
     const resized = tf.image.resizeBilinear(zone, [128, 128]);
     const brightness = resized.toFloat().div(255).mean().dataSync()[0];
     console.log(`[Bird] brightness=${brightness.toFixed(4)}`);
@@ -205,9 +280,10 @@ function analyzeBirdFrame(raw: Uint8Array): { brightness: number } {
 function analyzePhase1Frame(raw: Uint8Array, denomination: number | null) {
   return tf.tidy(() => {
     const img = decodeJpeg(raw, 3);
+    const z   = zonesFor(denomination);
 
     // ── Colour tone: the whole note ──
-    const noteImg = tf.image.resizeBilinear(cropToNote(img), [256, 256]).toFloat();
+    const noteImg = tf.image.resizeBilinear(cropToNote(img, denomination), [256, 256]).toFloat();
     const nr = noteImg.slice([0, 0, 0], [-1, -1, 1]);
     const ng = noteImg.slice([0, 0, 1], [-1, -1, 1]);
     const nb = noteImg.slice([0, 0, 2], [-1, -1, 1]);
@@ -226,26 +302,32 @@ function analyzePhase1Frame(raw: Uint8Array, denomination: number | null) {
     }
 
     // ── Clear window ──
-    // Structure seen through the transparent strip. A printout has no window,
-    // so that area is flat print: genuine 0.0514 variance vs fake 0.0369.
-    const winVar   = zoneVariance(img, ZONE_WINDOW);
-    const winLuma  = meanLuma(img, ZONE_WINDOW);
+    // Transparency cannot be seen in a single frame: printed detail and a real
+    // view-through both produce luminance variance, and the genuine note in
+    // fact measured LOWER variance (0.0264) than the counterfeit (0.0425).
+    // What separates them is behaviour over the tilt — a real window shows the
+    // background, so its brightness moves independently of the note, while a
+    // printed one is part of the note and tracks it exactly. Both readings are
+    // returned so the ratio between them can be tracked across frames.
+    const winVar   = zoneVariance(img, denomination, z.window);
+    const winLuma  = meanLuma(img, denomination, z.window);
+    const bodyLuma = meanLuma(img, denomination, z.ref);
 
     // ── Rolling colour: is the OVI patch actually coloured? ──
-    const oviChroma = zoneChroma(img, ZONE_ROLLING);
-    const oviHue    = zoneHue(img, ZONE_ROLLING);
+    const oviChroma = zoneChroma(img, denomination, z.rolling);
 
-    console.log(`[P1] noteHue=${noteHue.toFixed(1)}° sat=${saturation.toFixed(2)} oviChroma=${oviChroma.toFixed(4)} oviHue=${oviHue.toFixed(1)}° winVar=${winVar.toFixed(4)} winLuma=${winLuma.toFixed(3)}`);
-    return { colorTone, oviChroma, winVar };
+    console.log(`[P1] noteHue=${noteHue.toFixed(1)}° sat=${saturation.toFixed(2)} oviChroma=${oviChroma.toFixed(4)} winVar=${winVar.toFixed(4)} win/body=${winLuma.toFixed(3)}/${bodyLuma.toFixed(3)} ratio=${(bodyLuma > 0 ? winLuma / bodyLuma : 0).toFixed(3)}`);
+    return { colorTone, oviChroma, winVar, winLuma, bodyLuma };
   });
 }
 
-function analyzePhase2Frame(raw: Uint8Array) {
+function analyzePhase2Frame(raw: Uint8Array, denom: number | null) {
   return tf.tidy(() => {
     const img = decodeJpeg(raw, 3);
+    const z   = zonesFor(denom);
 
     // ── Substrate texture + intaglio edges: the printed note body ──
-    const noteImg = tf.image.resizeBilinear(cropToNote(img), [256, 256]).toFloat();
+    const noteImg = tf.image.resizeBilinear(cropToNote(img, denom), [256, 256]).toFloat();
     const r = noteImg.slice([0, 0, 0], [-1, -1, 1]);
     const g = noteImg.slice([0, 0, 1], [-1, -1, 1]);
     const b = noteImg.slice([0, 0, 2], [-1, -1, 1]);
@@ -261,12 +343,71 @@ function analyzePhase2Frame(raw: Uint8Array) {
     const noiseMean = noise.mean().dataSync()[0];
 
     // ── Dynamic movement: is the reversing numeral actually coloured? ──
-    const oviChroma = zoneChroma(img, ZONE_REVERSE);
-    const oviHue    = zoneHue(img, ZONE_REVERSE);
+    const oviChroma = zoneChroma(img, denom, z.reverse);
+    const oviHue    = zoneHue(img, denom, z.reverse);
 
     console.log(`[P2] sharp=${sharpness.toFixed(5)} detail=${noiseMean.toFixed(5)} oviChroma=${oviChroma.toFixed(4)} oviHue=${oviHue.toFixed(1)}°`);
     return { sharpness, detail: noiseMean, oviChroma };
   });
+}
+
+// The reversing numeral reads BACKWARDS on a genuine note — photographs of a
+// $5 show a large mirrored "5" in the dome. Optical character recognition will
+// not read a mirrored digit, so the test is asymmetric and needs no threshold:
+// crop the window band, read it as-is, then read it flipped horizontally.
+//
+//   genuine  — plain reading fails, mirrored reading returns the denomination
+//   printed  — whatever was printed reads the same either way, or not at all
+//
+// This is the only check here that yields a discrete answer rather than a
+// statistic, so it is unaffected by focus, working distance and ambient light.
+async function readReversedNumeral(
+  uri: string, width: number, height: number, denom: number | null,
+): Promise<{ plain: string; mirrored: string; reversedOk: boolean }> {
+  const empty = { plain: "", mirrored: "", reversedOk: false };
+  if (!denom) return empty;
+
+  try {
+    const crop = cropFor(denom);
+    const band = zonesFor(denom).reverse;
+    // Compose the note crop with the band inside it, in absolute pixels
+    const noteX = crop.x0 * width;
+    const noteY = crop.y0 * height;
+    const noteW = (crop.x1 - crop.x0) * width;
+    const noteH = (crop.y1 - crop.y0) * height;
+    const region = {
+      originX: Math.max(0, Math.round(noteX + band.x0 * noteW)),
+      originY: Math.max(0, Math.round(noteY + band.y0 * noteH)),
+      width:   Math.max(1, Math.round((band.x1 - band.x0) * noteW)),
+      height:  Math.max(1, Math.round((band.y1 - band.y0) * noteH)),
+    };
+
+    const readDigits = async (flip: boolean) => {
+      const ops: any[] = [{ crop: region }];
+      if (flip) ops.push({ flip: ImageManipulator.FlipType.Horizontal });
+      const out = await ImageManipulator.manipulateAsync(uri, ops, {
+        format: ImageManipulator.SaveFormat.JPEG, compress: 0.9,
+      });
+      const ocr = await withTimeout(TextRecognition.recognize(out.uri), 3000);
+      if (!ocr) return "";
+      return (ocr as any).blocks.map((b: any) => b.text).join(" ").replace(/\s+/g, " ").trim();
+    };
+
+    const plain    = await readDigits(false);
+    const mirrored = await readDigits(true);
+
+    const wanted     = String(denom);
+    const inPlain    = plain.includes(wanted);
+    const inMirrored = mirrored.includes(wanted);
+    // Only the mirrored reading should find the numeral
+    const reversedOk = inMirrored && !inPlain;
+
+    console.log(`[Reverse] want="${wanted}" plain="${plain}" mirrored="${mirrored}" → reversedOk=${reversedOk}`);
+    return { plain, mirrored, reversedOk };
+  } catch (e: any) {
+    console.log("[Reverse] failed:", e?.message);
+    return empty;
+  }
 }
 
 function parseOcrText(blocks: any[]): { serial: string | null; denom: number | null } {
@@ -332,17 +473,27 @@ export function CameraScreen() {
     rollingColour: false,
     oviChromas: [] as number[],
     winVars: [] as number[],
+    winRatios: [] as number[],
     colorToneFlags: [] as boolean[],
   });
   const p2 = useRef({
     oviChromas: [] as number[],
     sharpnesses: [] as number[],
     details: [] as number[],
+    // The frame whose OVI band was most vivid — the numeral is most likely to
+    // be fully formed there, so the mirrored-numeral read is done on it.
+    bestUri: "" as string,
+    bestChroma: -1,
+    bestW: 0,
+    bestH: 0,
+    reversedOk: false,
     bumpPattern: false,
     dynamicImage3d: false,
   });
   const birdBrightness = useRef<number[]>([]);
   const busyRef = useRef(false);
+  const settleUntilRef = useRef(0);
+  const [settling, setSettling] = useState(false);
 
   const updateCheck = (label: string, status: "pass" | "fail") =>
     setChecks(prev => prev.map(c => c.label === label ? { ...c, status } : c));
@@ -350,6 +501,11 @@ export function CameraScreen() {
   const stopInterval = () => {
     if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; }
   };
+
+  // True while the user is still moving into the position just asked for.
+  // Capture waits this out so frames are taken with the note held, not mid-swing.
+  const isSettling = () => Date.now() < settleUntilRef.current;
+  const beginSettle = () => { settleUntilRef.current = Date.now() + SETTLE_MS; };
 
   // Demonstrates the rocking motion the bird step asks for. Holding four
   // separate tilt poses under torchlight proved awkward; the check only needs
@@ -451,6 +607,7 @@ export function CameraScreen() {
     setProgress(0);
     setTorchOn(true);
     startRock();
+    beginSettle();
 
     busyRef.current = false;
     const startTime = Date.now();
@@ -465,8 +622,10 @@ export function CameraScreen() {
         return;
       }
 
-      // Capture is slower than the interval; skip ticks that would overlap
-      if (!cameraRef.current || busyRef.current) return;
+      // Wait for the note to have moved since the last sample, and skip ticks
+      // that would overlap a capture already running
+      setSettling(isSettling());
+      if (!cameraRef.current || busyRef.current || isSettling()) return;
       busyRef.current = true;
       try {
         // This step only needs the mean brightness of the window zone, which
@@ -476,9 +635,10 @@ export function CameraScreen() {
         });
         if (!photo?.base64) return;
         const raw = Uint8Array.from(atob(photo.base64), c => c.charCodeAt(0));
-        const { brightness } = analyzeBirdFrame(raw);
+        const { brightness } = analyzeBirdFrame(raw, p1.current.denomination);
         birdBrightness.current.push(brightness);
         runMlDenomination(raw);
+        beginSettle();
       } catch {} finally { busyRef.current = false; }
     }, FRAME_INTERVAL);
   };
@@ -500,6 +660,7 @@ export function CameraScreen() {
     setPhase("phase1");
     setProgress(0);
     setTiltHint(0);
+    beginSettle();
     busyRef.current = false;
     const startTime = Date.now();
 
@@ -514,7 +675,8 @@ export function CameraScreen() {
         return;
       }
 
-      if (!cameraRef.current || busyRef.current) return;
+      setSettling(isSettling());
+      if (!cameraRef.current || busyRef.current || isSettling()) return;
       busyRef.current = true;
       try {
         // Chroma and region variance tolerate compression; only the sharpness
@@ -528,32 +690,41 @@ export function CameraScreen() {
         const f = analyzePhase1Frame(raw, p1.current.denomination);
         p1.current.oviChromas.push(f.oviChroma);
         p1.current.winVars.push(f.winVar);
+        p1.current.winRatios.push(f.bodyLuma > 0 ? f.winLuma / f.bodyLuma : 0);
         p1.current.colorToneFlags.push(f.colorTone);
         setTiltHint(h => (h + 1) % TILT_HINTS.length);
+        beginSettle();
       } catch {} finally { busyRef.current = false; }
     }, FRAME_INTERVAL);
   };
 
   const finalizePhase1 = () => {
-    const { oviChromas, winVars, colorToneFlags } = p1.current;
+    const { oviChromas, winVars, winRatios, colorToneFlags } = p1.current;
 
     // Colour tone fails only if most frames agreed it was wrong
     const badTone   = colorToneFlags.filter(Boolean).length;
     const colorTone = colorToneFlags.length > 0 && badTone > colorToneFlags.length / 2;
 
-    // Clear window — structure seen through the transparent strip
+    // Clear window — does the window brighten and darken independently of the
+    // note body? A transparent panel shows the shifting background as the note
+    // tilts, so the window/body ratio moves. A printed panel is part of the
+    // note and holds a fixed ratio to it.
     const winVar      = median(winVars);
-    const clearWindow = winVars.length > 0 && winVar < TH_WINDOW_VAR;
+    const ratioSwing  = range(winRatios);
+    const clearWindow = winRatios.length >= 3 && ratioSwing < TH_WINDOW_RATIO_SWING;
 
-    // Rolling colour — the OVI patch must carry real colour, not read as grey
-    const chroma        = median(oviChromas);
-    const rollingColour = oviChromas.length > 0 && chroma < TH_OVI_CHROMA_FRONT;
+    // Rolling colour — the patch must either reach a strong colour at some
+    // angle, or visibly swing between angles. Printed ink does neither.
+    const chromaPeak  = oviChromas.length ? Math.max(...oviChromas) : 0;
+    const chromaSwing = range(oviChromas);
+    const rollingColour = oviChromas.length > 0 &&
+      chromaPeak < TH_OVI_CHROMA_PEAK && chromaSwing < TH_OVI_CHROMA_SWING;
 
     p1.current.colorTone     = colorTone;
     p1.current.clearWindow   = clearWindow;
     p1.current.rollingColour = rollingColour;
 
-    console.log(`[P1 Final] frames=${oviChromas.length} chroma=${chroma.toFixed(4)} winVar=${winVar.toFixed(4)} → tone=${colorTone} window=${clearWindow} rolling=${rollingColour}`);
+    console.log(`[P1 Final] frames=${oviChromas.length} chromaPeak=${chromaPeak.toFixed(4)} chromaSwing=${chromaSwing.toFixed(4)} winVar=${winVar.toFixed(4)} ratioSwing=${ratioSwing.toFixed(4)} → tone=${colorTone} window=${clearWindow} rolling=${rollingColour}`);
     updateCheck("Color Tone",     colorTone     ? "fail" : "pass");
     updateCheck("Clear Window",   clearWindow   ? "fail" : "pass");
     updateCheck("Rolling Colour", rollingColour ? "fail" : "pass");
@@ -564,6 +735,7 @@ export function CameraScreen() {
     setPhase("phase2");
     setProgress(0);
     setTiltHint(0);
+    beginSettle();
     busyRef.current = false;
     const startTime = Date.now();
 
@@ -577,7 +749,8 @@ export function CameraScreen() {
         return;
       }
 
-      if (!cameraRef.current || busyRef.current) return;
+      setSettling(isSettling());
+      if (!cameraRef.current || busyRef.current || isSettling()) return;
       busyRef.current = true;
       try {
         const photo = await cameraRef.current.takePictureAsync({
@@ -585,11 +758,18 @@ export function CameraScreen() {
         });
         if (!photo?.base64) return;
         const raw = Uint8Array.from(atob(photo.base64), c => c.charCodeAt(0));
-        const f = analyzePhase2Frame(raw);
+        const f = analyzePhase2Frame(raw, p1.current.denomination);
         p2.current.oviChromas.push(f.oviChroma);
         p2.current.sharpnesses.push(f.sharpness);
         p2.current.details.push(f.detail);
+        if (photo.uri && f.oviChroma > p2.current.bestChroma) {
+          p2.current.bestChroma = f.oviChroma;
+          p2.current.bestUri    = photo.uri;
+          p2.current.bestW      = photo.width  ?? 0;
+          p2.current.bestH      = photo.height ?? 0;
+        }
         setTiltHint(h => (h + 1) % TILT_HINTS.length);
+        beginSettle();
       } catch {} finally { busyRef.current = false; }
     }, FRAME_INTERVAL);
   };
@@ -597,9 +777,19 @@ export function CameraScreen() {
   const finalizePhase2 = async () => {
     const { oviChromas, sharpnesses, details } = p2.current;
 
-    // Dynamic movement — reversing numeral must be chromatic, not grey
-    const chroma          = median(oviChromas);
-    const dynamicMovement = oviChromas.length > 0 && chroma < TH_OVI_CHROMA_BACK;
+    // Mirrored-numeral read on the most vivid frame
+    if (p2.current.bestUri && p2.current.bestW && p2.current.bestH) {
+      const r = await readReversedNumeral(
+        p2.current.bestUri, p2.current.bestW, p2.current.bestH, p1.current.denomination,
+      );
+      p2.current.reversedOk = r.reversedOk;
+    }
+
+    // Dynamic movement — same peak-and-swing test as rolling colour
+    const chromaPeak      = oviChromas.length ? Math.max(...oviChromas) : 0;
+    const chromaSwing     = range(oviChromas);
+    const dynamicMovement = oviChromas.length > 0 &&
+      chromaPeak < TH_OVI_CHROMA_PEAK && chromaSwing < TH_OVI_CHROMA_SWING;
 
     // Median so a single motion-blurred frame can't flip either check.
     // Both of these measure high-frequency content, and the genuine note has
@@ -613,7 +803,7 @@ export function CameraScreen() {
     p2.current.bumpPattern    = bumpPattern;
     p2.current.dynamicImage3d = dynamicImage3d;
 
-    console.log(`[P2 Final] frames=${sharpnesses.length} chroma=${chroma.toFixed(4)} detail=${detail.toFixed(4)} sharp=${sharpness.toFixed(4)}`);
+    console.log(`[P2 Final] frames=${sharpnesses.length} chromaPeak=${chromaPeak.toFixed(4)} chromaSwing=${chromaSwing.toFixed(4)} detail=${detail.toFixed(4)} sharp=${sharpness.toFixed(4)}`);
 
     updateCheck("Dynamic Movement", dynamicMovement ? "fail" : "pass");
     updateCheck("3D Dynamic Image", dynamicImage3d  ? "fail" : "pass");
@@ -628,9 +818,16 @@ export function CameraScreen() {
     // fake, so it carries the most. Detail and window variance overlapped
     // between genuine scans and are kept at token weight — no combination of
     // them alone can now force a REVIEW.
+    // The mirrored numeral is a discrete reading rather than a threshold, so a
+    // clean result is strong evidence either way. It is only counted when the
+    // read succeeded at all — a silent OCR failure must not condemn a note.
+    const reverseTried = !!p2.current.bestUri && !!p1.current.denomination;
+    const reverseFail  = reverseTried && !p2.current.reversedOk;
+
     const score =
-      (flyingBirdFail  ? 0.35 : 0) +  // stable across repeat scans
-      (bumpPattern     ? 0.25 : 0) +  // separates, but narrowly
+      (flyingBirdFail  ? 0.30 : 0) +  // stable across repeat scans
+      (reverseFail     ? 0.25 : 0) +  // discrete, lighting-independent
+      (bumpPattern     ? 0.20 : 0) +  // separates, but narrowly
       (dynamicMovement ? 0.15 : 0) +
       (rollingColour   ? 0.15 : 0) +
       (colorTone       ? 0.10 : 0) +
@@ -658,15 +855,17 @@ export function CameraScreen() {
       `  6 Dynamic Move  : ${mark(dynamicMovement)}\n` +
       `  7 3D Image      : ${mark(dynamicImage3d)}\n` +
       `  8 Bump Patterns : ${mark(bumpPattern)}\n` +
+      `  9 Reversed "${p1.current.denomination ?? "?"}"  : ${reverseTried ? mark(reverseFail) : "not read"}\n` +
       `  ─────────────────────\n` +
       `  Risk score      : ${score.toFixed(2)} / 1.00  (fail above 0.40)\n` +
       `  ML denom conf   : ${p1.current.mlScore.toFixed(3)}  (identification only)\n` +
       `  VERDICT         : ${verdict}\n` +
       `═════════════════════════\n` +
       `  raw: birdVar=${range(birdBrightness.current).toFixed(4)}(n=${birdBrightness.current.length}) ` +
-      `p1Chroma=${median(p1.current.oviChromas).toFixed(4)}(n=${p1.current.oviChromas.length}) ` +
-      `winVar=${median(p1.current.winVars).toFixed(4)} ` +
-      `p2Chroma=${chroma.toFixed(4)} detail=${detail.toFixed(4)} sharp=${sharpness.toFixed(4)}\n`
+      `p1Peak=${p1.current.oviChromas.length ? Math.max(...p1.current.oviChromas).toFixed(4) : "0"}(n=${p1.current.oviChromas.length}) ` +
+      `p1Swing=${range(p1.current.oviChromas).toFixed(4)} ` +
+      `winRatioSwing=${range(p1.current.winRatios).toFixed(4)} ` +
+      `p2Peak=${chromaPeak.toFixed(4)} p2Swing=${chromaSwing.toFixed(4)} detail=${detail.toFixed(4)} sharp=${sharpness.toFixed(4)}\n`
     );
     triggerHaptic(verdict);
 
@@ -725,7 +924,7 @@ export function CameraScreen() {
 
   const NoteFrame = ({ children }: { children?: React.ReactNode }) => (
     <View style={styles.frameWrap} pointerEvents="none">
-      <View style={styles.frame}>
+      <View style={[styles.frame, { height: frameHeightFor(denom) }]}>
         <View style={[styles.fCorner, styles.fTL, { borderColor: accent }]} />
         <View style={[styles.fCorner, styles.fTR, { borderColor: accent }]} />
         <View style={[styles.fCorner, styles.fBL, { borderColor: accent }]} />
@@ -837,8 +1036,12 @@ export function CameraScreen() {
 
         {/* Rocking motion prompt */}
         <View style={styles.hintFloat} pointerEvents="none">
-          <Text style={[styles.hintArrow, { color: accent }]}>↔</Text>
-          <Text style={[styles.hintLabel, { color: accent }]}>ROCK SLOWLY</Text>
+          <Text style={[styles.hintArrow, { color: settling ? accent : "#4ADE80" }]}>
+            {settling ? "↔" : "\u25CF"}
+          </Text>
+          <Text style={[styles.hintLabel, { color: settling ? accent : "#4ADE80" }]}>
+            {settling ? "ROCK SLOWLY" : "HOLD STILL"}
+          </Text>
         </View>
 
         <View style={styles.sheet}>
@@ -866,7 +1069,8 @@ export function CameraScreen() {
           </View>
 
           <Text style={styles.tip}>
-            {Math.round(progress * TARGET_FRAMES)} of {TARGET_FRAMES} captured — keep rocking until the bar fills
+            {settling ? "Rock the note to a new angle" : "Hold it there — capturing"}
+            {"  ·  "}{Math.round(progress * TARGET_FRAMES)}/{TARGET_FRAMES}
           </Text>
         </View>
       </View>
@@ -944,14 +1148,18 @@ export function CameraScreen() {
 
       <NoteFrame>
         <Zone
-          style={isPhase2 ? styles.zoneTopLeft : styles.zoneBottomLeft}
-          label={isPhase2 ? "NUMBER\nREVERSING" : "ROLLING\nCOLOUR"}
+          style={styles.zoneOviBand}
+          label={isPhase2 ? "COLOUR-SHIFTING FEATURES" : "CLEAR WINDOW & COLOUR SHIFT"}
         />
       </NoteFrame>
 
       <View style={styles.hintFloat} pointerEvents="none">
-        <Text style={[styles.hintArrow, { color: accent }]}>{TILT_HINTS[tiltHint].arrow}</Text>
-        <Text style={[styles.hintLabel, { color: accent }]}>{TILT_HINTS[tiltHint].label}</Text>
+        <Text style={[styles.hintArrow, { color: settling ? accent : "#4ADE80" }]}>
+          {settling ? TILT_HINTS[tiltHint].arrow : "\u25CF"}
+        </Text>
+        <Text style={[styles.hintLabel, { color: settling ? accent : "#4ADE80" }]}>
+          {settling ? TILT_HINTS[tiltHint].label : "HOLD STILL"}
+        </Text>
       </View>
 
       <View style={styles.sheet}>
@@ -972,7 +1180,10 @@ export function CameraScreen() {
 
         <ProgressBar />
         <Text style={styles.tip}>
-          {Math.round(progress * TARGET_FRAMES)} of {TARGET_FRAMES} captured — hold each tilt until it advances
+          {settling
+            ? `Move to the ${TILT_HINTS[tiltHint].label.replace("TILT ", "").toLowerCase()} position`
+            : "Hold it there — capturing"}
+          {"  ·  "}{Math.round(progress * TARGET_FRAMES)}/{TARGET_FRAMES}
         </Text>
         <CheckList items={isPhase2 ? checks.slice(5) : checks.slice(2, 5)} />
       </View>
@@ -1010,7 +1221,7 @@ const styles = StyleSheet.create({
 
   // ── Note frame ──
   frameWrap: { ...StyleSheet.absoluteFillObject, alignItems: "center", justifyContent: "center", paddingBottom: 120 },
-  frame:     { width: FRAME_W, height: FRAME_H, alignItems: "center", justifyContent: "center" },
+  frame:     { width: FRAME_W, alignItems: "center", justifyContent: "center" },
   fCorner:   { position: "absolute", width: 30, height: 30, borderWidth: 3, borderRadius: 2 },
   fTL: { top: 0,    left: 0,  borderRightWidth: 0, borderBottomWidth: 0 },
   fTR: { top: 0,    right: 0, borderLeftWidth: 0,  borderBottomWidth: 0 },
@@ -1025,8 +1236,7 @@ const styles = StyleSheet.create({
   },
   zoneLabel:      { fontSize: 9, fontWeight: "900", letterSpacing: 1, textAlign: "center", lineHeight: 12 },
   zoneSerial:     { top: "3%",    left: "6%",  right: "6%",  height: "8%" },
-  zoneTopLeft:    { top: "5%",    left: "6%",  width: "42%", height: "14%" },
-  zoneBottomLeft: { bottom: "5%", left: "6%",  width: "42%", height: "14%" },
+  zoneOviBand:    { top: "36%",   left: "5%",  right: "5%",  height: "34%" },
 
   // ── Floating tilt hint ──
   hintFloat: {
