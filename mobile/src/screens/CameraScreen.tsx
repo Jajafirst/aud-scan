@@ -15,29 +15,14 @@ import { decodeJpeg } from "@tensorflow/tfjs-react-native";
 const MODEL_URL       = "https://teachablemachine.withgoogle.com/models/Z11VY1264/";
 const DENOM_THRESHOLD = 0.35;
 const PASS_THRESHOLD  = 0.80;
-// Capture takes roughly 3s per frame, far slower than the tilt instructions
-// used to cycle. Phases therefore run to a FRAME COUNT, not a clock: each
-// prompt stays up until a frame is actually taken for it, so every direction
-// the user is asked for contributes a sample. PHASE_TIMEOUT only rescues a
-// phase where capture has stalled.
+// Bird/tilt phases used to run on a timer that GUESSED when the user had
+// finished moving — first tuned for a small motion, then a bigger target
+// angle was asked for without the wait time following, and the screen said
+// HOLD STILL before the user had physically finished tilting. A timer can
+// only ever guess this; it was replaced with a button the user taps when
+// they are actually in position, so capture timing is never wrong again.
+// Phases still stop once every direction has contributed a frame.
 const TARGET_FRAMES   = 4;     // one per tilt direction
-const PHASE_TIMEOUT   = 30000; // ms — safety net, not the normal exit
-const FRAME_INTERVAL  = 300;   // fires often; a busy guard drops overlapping calls
-// Grace period after a prompt changes, before the next capture starts. Without
-// it the shutter fired the instant the arrow moved, so every frame caught the
-// note mid-swing between positions instead of held at one.
-// Time allowed to reach the requested position before a frame is taken. It
-// exists so frames are captured with the note held, not mid-swing.
-//
-// This was cut to 1000ms on the assumption that a left-right rock arrives
-// faster than the old up/down reach. That held at the time, but a later
-// change asked for a much bigger tilt (TILT_TARGET_DEG, ~35°) without raising
-// this back — the user reported the screen switching to HOLD STILL before
-// they had physically finished tilting, and the data agreed: a genuine note
-// scored front swing 0.0179, below the 0.025 threshold, and the bird check
-// failed outright, both consistent with frames caught mid-motion rather than
-// held at the target angle. Back up to 1500ms to give the bigger motion room.
-const SETTLE_MS       = 1500;
 
 // Feature thresholds, from two scans of genuine $10 AK173948183 and one of
 // counterfeit AK173948185.
@@ -678,7 +663,6 @@ export function CameraScreen() {
     { label: "Bump Patterns",    status: "pending" },
   ]);
 
-  const rockAnim       = useRef(new Animated.Value(0)).current;
   const intervalRef    = useRef<ReturnType<typeof setInterval> | null>(null);
   const modelRef       = useRef<tf.LayersModel | null>(null);
   const labelsRef      = useRef<string[]>([]);
@@ -725,8 +709,14 @@ export function CameraScreen() {
   const birdVariance   = useRef<number[]>([]);
   const birdPatches    = useRef<number[][]>([]);
   const busyRef = useRef(false);
-  const settleUntilRef = useRef(0);
-  const [settling, setSettling] = useState(false);
+  // Replaces a timer that guessed when the user had finished tilting. It
+  // guessed wrong more than once: SETTLE_MS was tuned for a small motion,
+  // then the target tilt got bigger (TILT_TARGET_DEG) without the wait time
+  // following, and the screen said HOLD STILL before the user had physically
+  // gotten there. Capture is now user-triggered — the app can never be wrong
+  // about whether you have finished moving, because you are the one who
+  // decides that by tapping.
+  const [capturing, setCapturing] = useState(false);
   // Live readout of the SAME numbers that decide the verdict, so the on-screen
   // feedback during a tilt is never a guess — it is exactly what the score
   // will use. Before this, the only guidance was a demo icon to copy; there
@@ -747,21 +737,6 @@ export function CameraScreen() {
 
   // True while the user is still moving into the position just asked for.
   // Capture waits this out so frames are taken with the note held, not mid-swing.
-  const isSettling = () => Date.now() < settleUntilRef.current;
-  const beginSettle = () => { settleUntilRef.current = Date.now() + SETTLE_MS; };
-
-  // Demonstrates the rocking motion the bird step asks for. Holding four
-  // separate tilt poses under torchlight proved awkward; the check only needs
-  // the note to move relative to the light, which a slow rock provides.
-  const startRock = () => {
-    Animated.loop(
-      Animated.sequence([
-        Animated.timing(rockAnim, { toValue:  1, duration: 900, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
-        Animated.timing(rockAnim, { toValue: -1, duration: 900, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
-      ])
-    ).start();
-  };
-
   // The scan does not start the moment the screen opens. Repeat scans of the
   // same genuine note produced swing values from 0.024 to 0.057 on one check
   // alone — a spread as wide as the real/fake gap it is meant to detect — and
@@ -869,9 +844,12 @@ export function CameraScreen() {
   };
 
   // ─── STEP 2: Flying Bird (torch on, tilt all directions) ─────────────────
+  // Capture is user-triggered: tilt to the shown direction, tap the button
+  // when you're there. No timer decides this for you.
   const startBirdPhase = () => {
     setPhase("bird");
     setProgress(0);
+    setTiltHint(0);
     // Clear last scan's samples — these refs outlive a single scan, so without
     // this a second scan without remounting would average in the first note.
     birdBrightness.current = [];
@@ -880,46 +858,37 @@ export function CameraScreen() {
     birdPatches.current    = [];
     setLiveBirdStates(0);
     setTorchOn(true);
-    startRock();
-    beginSettle();
-
     busyRef.current = false;
-    const startTime = Date.now();
-    intervalRef.current = setInterval(async () => {
-      const done = birdBrightness.current.length;
-      setProgress(Math.min(done / TARGET_FRAMES, 1));
+  };
 
-      // Finish once every direction has contributed a frame
-      if (done >= TARGET_FRAMES || Date.now() - startTime >= PHASE_TIMEOUT) {
-        stopInterval();
+  const captureBirdFrame = async () => {
+    if (!cameraRef.current || busyRef.current) return;
+    busyRef.current = true;
+    setCapturing(true);
+    try {
+      // This step only needs the mean brightness of the window zone, which
+      // survives heavy compression, so capture cheaply and finish sooner.
+      const photo = await cameraRef.current.takePictureAsync({
+        base64: true, quality: 0.2, skipProcessing: true, shutterSound: false,
+      });
+      if (!photo?.base64) return;
+      const raw = Uint8Array.from(atob(photo.base64), c => c.charCodeAt(0));
+      const b = analyzeBirdFrame(raw, p1.current.denomination);
+      birdBrightness.current.push(b.brightness);
+      birdRatio.current.push(b.ratio);
+      birdVariance.current.push(b.variance);
+      birdPatches.current.push(b.patch);
+      setLiveBirdStates(countDistinctStates(birdPatches.current, TH_PATCH_SAME));
+      runMlDenomination(raw);
+
+      const done = birdPatches.current.length;
+      setProgress(Math.min(done / TARGET_FRAMES, 1));
+      setTiltHint(h => (h + 1) % TILT_HINTS.length);
+      if (done >= TARGET_FRAMES) {
         setTorchOn(false);
         finalizeBird();
-        return;
       }
-
-      // Wait for the note to have moved since the last sample, and skip ticks
-      // that would overlap a capture already running
-      setSettling(isSettling());
-      if (!cameraRef.current || busyRef.current || isSettling()) return;
-      busyRef.current = true;
-      try {
-        // This step only needs the mean brightness of the window zone, which
-        // survives heavy compression, so capture cheaply and finish sooner.
-        const photo = await cameraRef.current.takePictureAsync({
-          base64: true, quality: 0.2, skipProcessing: true, shutterSound: false,
-        });
-        if (!photo?.base64) return;
-        const raw = Uint8Array.from(atob(photo.base64), c => c.charCodeAt(0));
-        const b = analyzeBirdFrame(raw, p1.current.denomination);
-        birdBrightness.current.push(b.brightness);
-        birdRatio.current.push(b.ratio);
-        birdVariance.current.push(b.variance);
-        birdPatches.current.push(b.patch);
-        setLiveBirdStates(countDistinctStates(birdPatches.current, TH_PATCH_SAME));
-        runMlDenomination(raw);
-        beginSettle();
-      } catch {} finally { busyRef.current = false; }
-    }, FRAME_INTERVAL);
+    } catch {} finally { busyRef.current = false; setCapturing(false); }
   };
 
   const finalizeBird = () => {
@@ -962,43 +931,37 @@ export function CameraScreen() {
     setProgress(0);
     setTiltHint(0);
     setLiveSwing(0);
-    beginSettle();
     busyRef.current = false;
-    const startTime = Date.now();
+  };
 
-    intervalRef.current = setInterval(async () => {
+  const capturePhase1Frame = async () => {
+    if (!cameraRef.current || busyRef.current) return;
+    busyRef.current = true;
+    setCapturing(true);
+    try {
+      // Chroma and region variance tolerate compression; only the sharpness
+      // measure in phase 2 needs full detail.
+      const photo = await cameraRef.current.takePictureAsync({
+        base64: true, quality: 0.4, skipProcessing: true, shutterSound: false,
+      });
+      if (!photo?.base64) return;
+      const raw = Uint8Array.from(atob(photo.base64), c => c.charCodeAt(0));
+      runMlDenomination(raw);
+      const f = analyzePhase1Frame(raw, p1.current.denomination);
+      p1.current.oviChromas.push(f.oviChroma);
+      p1.current.winVars.push(f.winVar);
+      p1.current.winRatios.push(f.bodyLuma > 0 ? f.winLuma / f.bodyLuma : 0);
+      p1.current.colorToneFlags.push(f.colorTone);
+      setLiveSwing(range(p1.current.oviChromas));
+
       const done = p1.current.oviChromas.length;
       setProgress(Math.min(done / TARGET_FRAMES, 1));
-
-      if (done >= TARGET_FRAMES || Date.now() - startTime >= PHASE_TIMEOUT) {
-        stopInterval();
+      setTiltHint(h => (h + 1) % TILT_HINTS.length);
+      if (done >= TARGET_FRAMES) {
         finalizePhase1();
         setPhase("flip");
-        return;
       }
-
-      setSettling(isSettling());
-      if (!cameraRef.current || busyRef.current || isSettling()) return;
-      busyRef.current = true;
-      try {
-        // Chroma and region variance tolerate compression; only the sharpness
-        // measure in phase 2 needs full detail.
-        const photo = await cameraRef.current.takePictureAsync({
-          base64: true, quality: 0.4, skipProcessing: true, shutterSound: false,
-        });
-        if (!photo?.base64) return;
-        const raw = Uint8Array.from(atob(photo.base64), c => c.charCodeAt(0));
-        runMlDenomination(raw);
-        const f = analyzePhase1Frame(raw, p1.current.denomination);
-        p1.current.oviChromas.push(f.oviChroma);
-        p1.current.winVars.push(f.winVar);
-        p1.current.winRatios.push(f.bodyLuma > 0 ? f.winLuma / f.bodyLuma : 0);
-        p1.current.colorToneFlags.push(f.colorTone);
-        setLiveSwing(range(p1.current.oviChromas));
-        setTiltHint(h => (h + 1) % TILT_HINTS.length);
-        beginSettle();
-      } catch {} finally { busyRef.current = false; }
-    }, FRAME_INTERVAL);
+    } catch {} finally { busyRef.current = false; setCapturing(false); }
   };
 
   const finalizePhase1 = () => {
@@ -1043,45 +1006,37 @@ export function CameraScreen() {
     setProgress(0);
     setTiltHint(0);
     setLiveSwing2(0);
-    beginSettle();
     busyRef.current = false;
-    const startTime = Date.now();
+  };
 
-    intervalRef.current = setInterval(async () => {
-      const done = p2.current.sharpnesses.length;
-      setProgress(Math.min(done / TARGET_FRAMES, 1));
-
-      if (done >= TARGET_FRAMES || Date.now() - startTime >= PHASE_TIMEOUT) {
-        stopInterval();
-        await finalizePhase2();
-        return;
+  const capturePhase2Frame = async () => {
+    if (!cameraRef.current || busyRef.current) return;
+    busyRef.current = true;
+    setCapturing(true);
+    try {
+      const photo = await cameraRef.current.takePictureAsync({
+        base64: true, quality: 0.7, skipProcessing: true, shutterSound: false,
+      });
+      if (!photo?.base64) return;
+      const raw = Uint8Array.from(atob(photo.base64), c => c.charCodeAt(0));
+      const f = analyzePhase2Frame(raw, p1.current.denomination);
+      p2.current.oviChromas.push(f.oviChroma);
+      p2.current.sharpnesses.push(f.sharpness);
+      p2.current.details.push(f.detail);
+      p2.current.numeralPatches.push(f.numeralPatch);
+      setLiveSwing2(range(p2.current.oviChromas));
+      if (photo.uri && f.oviChroma > p2.current.bestChroma) {
+        p2.current.bestChroma = f.oviChroma;
+        p2.current.bestUri    = photo.uri;
+        p2.current.bestW      = photo.width  ?? 0;
+        p2.current.bestH      = photo.height ?? 0;
       }
 
-      setSettling(isSettling());
-      if (!cameraRef.current || busyRef.current || isSettling()) return;
-      busyRef.current = true;
-      try {
-        const photo = await cameraRef.current.takePictureAsync({
-          base64: true, quality: 0.7, skipProcessing: true, shutterSound: false,
-        });
-        if (!photo?.base64) return;
-        const raw = Uint8Array.from(atob(photo.base64), c => c.charCodeAt(0));
-        const f = analyzePhase2Frame(raw, p1.current.denomination);
-        p2.current.oviChromas.push(f.oviChroma);
-        p2.current.sharpnesses.push(f.sharpness);
-        p2.current.details.push(f.detail);
-        p2.current.numeralPatches.push(f.numeralPatch);
-        setLiveSwing2(range(p2.current.oviChromas));
-        if (photo.uri && f.oviChroma > p2.current.bestChroma) {
-          p2.current.bestChroma = f.oviChroma;
-          p2.current.bestUri    = photo.uri;
-          p2.current.bestW      = photo.width  ?? 0;
-          p2.current.bestH      = photo.height ?? 0;
-        }
-        setTiltHint(h => (h + 1) % TILT_HINTS.length);
-        beginSettle();
-      } catch {} finally { busyRef.current = false; }
-    }, FRAME_INTERVAL);
+      const done = p2.current.sharpnesses.length;
+      setProgress(Math.min(done / TARGET_FRAMES, 1));
+      setTiltHint(h => (h + 1) % TILT_HINTS.length);
+      if (done >= TARGET_FRAMES) await finalizePhase2();
+    } catch {} finally { busyRef.current = false; setCapturing(false); }
   };
 
   const finalizePhase2 = async () => {
@@ -1362,6 +1317,7 @@ export function CameraScreen() {
 
   // ─── STEP 2: BIRD ────────────────────────────────────────────────────────
   if (phase === "bird") {
+    const dir = TILT_HINTS[tiltHint];
     return (
       <View style={styles.root}>
         <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" enableTorch={torchOn} onCameraReady={onCameraReady} />
@@ -1370,36 +1326,29 @@ export function CameraScreen() {
         <TopBar step={1} onClose={() => { stopInterval(); setTorchOn(false); navigation.goBack(); }} />
 
         <NoteFrame>
-          {/* Demonstrates the target angle, not just the direction. At the old
-              +/-18deg it modelled a shallower tilt than the checks need — and
-              repeat genuine scans showed colour swing shrinking once users
-              were told to move "slowly" with nothing showing how far "slowly"
-              still had to go. This rotates as far as the note itself should. */}
-          <Animated.View style={[styles.birdBadge, {
+          {/* Static, not animated. A continuously rocking icon with no fixed
+              relationship to when the photo is actually taken was the source
+              of "I don't understand how to follow it". This shows the ONE
+              position to hold the note at right now: tilted the direction
+              named below, held there until you tap Capture. */}
+          <View style={[styles.birdBadge, {
             borderColor: accent, backgroundColor: `${accent}22`,
-            transform: [{ rotate: rockAnim.interpolate({
-              inputRange: [-1, 1], outputRange: [`-${TILT_TARGET_DEG}deg`, `${TILT_TARGET_DEG}deg`],
-            }) }],
+            transform: [{ rotate: `${tiltHint === 0 ? -TILT_TARGET_DEG : TILT_TARGET_DEG}deg` }],
           }]}>
             <Text style={styles.birdIcon}>🦅</Text>
-          </Animated.View>
+          </View>
         </NoteFrame>
 
-        {/* Rocking motion prompt */}
         <View style={styles.hintFloat} pointerEvents="none">
-          <Text style={[styles.hintArrow, { color: settling ? accent : "#4ADE80" }]}>
-            {settling ? "↔" : "\u25CF"}
-          </Text>
-          <Text style={[styles.hintLabel, { color: settling ? accent : "#4ADE80" }]}>
-            {settling ? "ROCK SLOWLY" : "HOLD STILL"}
-          </Text>
+          <Text style={[styles.hintArrow, { color: accent }]}>{dir.arrow}</Text>
+          <Text style={[styles.hintLabel, { color: accent }]}>{dir.label} ~{TILT_TARGET_DEG}°</Text>
         </View>
 
         <View style={styles.sheet}>
           <View style={styles.sheetHead}>
             <View style={{ flex: 1 }}>
               <Text style={styles.sheetTitle}>Flying Bird</Text>
-              <Text style={styles.sheetSub}>Rock about {TILT_TARGET_DEG}° each way — follow the eagle</Text>
+              <Text style={styles.sheetSub}>Tilt the note the way shown, then tap the button below</Text>
             </View>
             <View style={[styles.torchChip, { borderColor: accent }]}>
               <Text style={[styles.torchText, { color: accent }]}>⚡ FLASH ON</Text>
@@ -1407,38 +1356,31 @@ export function CameraScreen() {
           </View>
 
           <ProgressBar />
+          <Text style={styles.tip}>{Math.round(progress * TARGET_FRAMES)}/{TARGET_FRAMES} captured</Text>
 
-          <View style={styles.rockTrack}>
-            <Text style={[styles.rockEnd, { color: accent }]}>◀</Text>
-            <Animated.View style={[styles.rockDot, {
-              backgroundColor: accent,
-              transform: [{ translateX: rockAnim.interpolate({
-                inputRange: [-1, 1], outputRange: [-70, 70],
-              }) }],
-            }]} />
-            <Text style={[styles.rockEnd, { color: accent }]}>▶</Text>
-          </View>
-
-          <Text style={styles.tip}>
-            {settling ? `Rock to about ${TILT_TARGET_DEG}° — like the eagle` : "Hold it there — capturing"}
-            {"  ·  "}{Math.round(progress * TARGET_FRAMES)}/{TARGET_FRAMES}
-          </Text>
-          {/* Live readout of the exact number the verdict uses. Shown only
-              while actively rocking (settling) — showing "tilt further" at
-              the same moment the big indicator says HOLD STILL told the user
-              two contradictory things at once. */}
-          {settling && birdPatches.current.length >= 2 && (
+          {/* Live readout of the exact number the verdict uses. There is no
+              separate "hold still" moment anymore for it to contradict. */}
+          {birdPatches.current.length >= 2 && (
             <Text style={[styles.liveReadout, { color: liveBirdStates >= TH_MIN_STATES ? "#4ADE80" : accent }]}>
               {liveBirdStates >= TH_MIN_STATES
                 ? `✓ Good — ${liveBirdStates} distinct looks captured`
-                : `Keep rocking — only ${liveBirdStates} distinct look${liveBirdStates === 1 ? "" : "s"} so far`}
+                : `Try a bigger tilt next — only ${liveBirdStates} distinct look${liveBirdStates === 1 ? "" : "s"} so far`}
             </Text>
           )}
+
+          <TouchableOpacity
+            style={[styles.btn, styles.btnWide, { backgroundColor: accent, opacity: capturing ? 0.6 : 1 }]}
+            onPress={captureBirdFrame}
+            disabled={capturing}
+          >
+            {capturing
+              ? <ActivityIndicator size="small" color="#000" />
+              : <Text style={styles.btnText}>I\'M TILTED — CAPTURE</Text>}
+          </TouchableOpacity>
         </View>
       </View>
     );
   }
-
   // ─── SETUP: how to hold the note, shown once before every scan ─────────────
   // Three rules, chosen because they are the three things that varied most
   // between repeat scans of the same note in testing: how far the note sits
@@ -1554,6 +1496,7 @@ export function CameraScreen() {
 
   // ─── STEP 3 / 4: TILT SCANS ──────────────────────────────────────────────
   const isPhase2 = phase === "phase2";
+  const capturePhaseFrame = isPhase2 ? capturePhase2Frame : capturePhase1Frame;
   return (
     <View style={styles.root}>
       <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" onCameraReady={onCameraReady} />
@@ -1561,12 +1504,6 @@ export function CameraScreen() {
 
       <TopBar step={isPhase2 ? 3 : 2} onClose={() => { stopInterval(); navigation.goBack(); }} />
 
-      {/* The rocking icon that was here duplicated the HOLD STILL indicator
-          below \u2014 both centred on the note, so the icon was hidden behind it
-          and the screen just looked like an empty circle. The big arrow +
-          label below already carries the direction and angle; removed rather
-          than fixing the overlap, since the note has a zone label and a
-          direction arrow already competing for attention in a small area. */}
       <NoteFrame>
         <Zone
           style={styles.zoneOviBand}
@@ -1574,22 +1511,18 @@ export function CameraScreen() {
         />
       </NoteFrame>
 
+      {/* Static direction indicator, matching the bird step: one position to
+          hold the note at, held until the button below is tapped. */}
       <View style={styles.hintFloat} pointerEvents="none">
-        <Text style={[styles.hintArrow, { color: settling ? accent : "#4ADE80" }]}>
-          {settling ? TILT_HINTS[tiltHint].arrow : "\u25CF"}
-        </Text>
-        <Text style={[styles.hintLabel, { color: settling ? accent : "#4ADE80" }]}>
-          {settling ? `${TILT_HINTS[tiltHint].label} ~${TILT_TARGET_DEG}\u00B0` : "HOLD STILL"}
-        </Text>
+        <Text style={[styles.hintArrow, { color: accent }]}>{TILT_HINTS[tiltHint].arrow}</Text>
+        <Text style={[styles.hintLabel, { color: accent }]}>{TILT_HINTS[tiltHint].label} ~{TILT_TARGET_DEG}°</Text>
       </View>
 
       <View style={styles.sheet}>
         <View style={styles.sheetHead}>
           <View style={{ flex: 1 }}>
             <Text style={styles.sheetTitle}>{isPhase2 ? "Back Side" : "Front Side"}</Text>
-            <Text style={styles.sheetSub}>
-              Tilt about {TILT_TARGET_DEG}° each way — follow the note icon above
-            </Text>
+            <Text style={styles.sheetSub}>Tilt the note the way shown, then tap the button below</Text>
           </View>
           {serial ? (
             <View style={styles.serialTag}>
@@ -1600,19 +1533,11 @@ export function CameraScreen() {
         </View>
 
         <ProgressBar />
-        <Text style={styles.tip}>
-          {settling
-            ? `Tilt ${TILT_HINTS[tiltHint].label.replace("TILT ", "").toLowerCase()} — about ${TILT_TARGET_DEG}°`
-            : "Hold it there — capturing"}
-          {"  ·  "}{Math.round(progress * TARGET_FRAMES)}/{TARGET_FRAMES}
-        </Text>
-        {/* Same live readout as the bird step, reading whichever side's swing
-            this phase is collecting — the actual number the score will use.
-            Shown only while actively tilting (settling), not while the big
-            indicator above says HOLD STILL — showing both at once told the
-            user two contradictory things at the same time. */}
+        <Text style={styles.tip}>{Math.round(progress * TARGET_FRAMES)}/{TARGET_FRAMES} captured</Text>
+
+        {/* Live readout of the exact number the verdict uses. No separate
+            "hold still" state exists here anymore for it to contradict. */}
         {(() => {
-          if (!settling) return null;
           const swing = isPhase2 ? liveSwing2 : liveSwing;
           const need  = isPhase2 ? TH_OVI_SWING_BACK : TH_OVI_SWING_FRONT;
           const frames = isPhase2 ? p2.current.oviChromas.length : p1.current.oviChromas.length;
@@ -1622,10 +1547,21 @@ export function CameraScreen() {
             <Text style={[styles.liveReadout, { color: good ? "#4ADE80" : accent }]}>
               {good
                 ? `✓ Good — colour shift detected (${swing.toFixed(3)})`
-                : `Keep tilting — barely any colour shift yet (${swing.toFixed(3)})`}
+                : `Try a bigger tilt next — barely any colour shift yet (${swing.toFixed(3)})`}
             </Text>
           );
         })()}
+
+        <TouchableOpacity
+          style={[styles.btn, styles.btnWide, { backgroundColor: accent, opacity: capturing ? 0.6 : 1 }]}
+          onPress={capturePhaseFrame}
+          disabled={capturing}
+        >
+          {capturing
+            ? <ActivityIndicator size="small" color="#000" />
+            : <Text style={styles.btnText}>I\'M TILTED — CAPTURE</Text>}
+        </TouchableOpacity>
+
         <CheckList items={isPhase2 ? checks.slice(5) : checks.slice(2, 5)} />
       </View>
     </View>
@@ -1734,14 +1670,6 @@ const styles = StyleSheet.create({
   readoutPending: { color: "rgba(255,255,255,0.45)", fontSize: 14 },
   readoutOk:      { color: "#4ADE80", fontSize: 9, fontWeight: "900", letterSpacing: 2, marginBottom: 7 },
   readoutValue:   { color: "#fff", fontSize: 24, fontWeight: "700", fontFamily: "monospace", letterSpacing: 2 },
-
-  // ── D-pad ──
-  rockTrack: {
-    flexDirection: "row", alignItems: "center", justifyContent: "center",
-    alignSelf: "center", gap: 14, height: 40,
-  },
-  rockEnd: { fontSize: 15, opacity: 0.5 },
-  rockDot: { width: 12, height: 12, borderRadius: 6 },
 
   torchChip: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 9, borderWidth: 1, backgroundColor: "rgba(0,0,0,0.4)" },
   torchText: { fontSize: 9, fontWeight: "900", letterSpacing: 1 },
