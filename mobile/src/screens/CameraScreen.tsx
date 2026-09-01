@@ -28,7 +28,12 @@ const PASS_THRESHOLD  = 0.80;
 // clock involved, so it can't fire too early, and no button to notice either.
 const MOTION_THUMB          = 16;   // thumbnail side, pixels — cheap on purpose
 const MOTION_MOVE_THRESHOLD = 0.05; // above this, frame-to-frame, counts as "moving"
-const MOTION_STILL_THRESHOLD = 0.02; // below this counts as "held still"
+// Loosened from 0.02 — a strict "still" threshold fights a real hand, which
+// always has some tremor, especially holding a tilt for several seconds
+// waiting to be accepted. Reported as physically tiring on the wrist; a
+// slightly looser bar reaches "held" sooner without needing the note to stop
+// moving completely.
+const MOTION_STILL_THRESHOLD = 0.035;
 // Tried polling with a separate cheap throwaway photo, saving the full
 // quality capture for the one accepted frame per direction. Reverted: on a
 // real phone, camera shutter time is set by hardware (autofocus, exposure
@@ -37,7 +42,13 @@ const MOTION_STILL_THRESHOLD = 0.02; // below this counts as "held still"
 // the number of shutter calls made every accepted frame slower, not faster.
 // Back to one photo per tick, reused for both the motion check and analysis.
 const POLL_INTERVAL_MS = 300;
-const TARGET_FRAMES   = 4;     // one per tilt direction
+// Cut from 4 to 3 — each frame means holding a tilt until the app accepts
+// it, and four holds per phase (bird, front, back — twelve total across a
+// scan) was reported as physically tiring. Three still gives every measure
+// enough points to compute a swing or a state count from; it costs some
+// robustness against one clean state-counting evidence in favour of finishing
+// the scan without straining a wrist to get it.
+const TARGET_FRAMES   = 3;
 
 // Feature thresholds, from two scans of genuine $10 AK173948183 and one of
 // counterfeit AK173948185.
@@ -1476,14 +1487,16 @@ export function CameraScreen() {
             const win = zonesFor(denom).window;
             const cx  = ((win.x0 + win.x1) / 2) * 100;
             const cy  = ((win.y0 + win.y1) / 2) * 100;
+            // A filled circle with an emoji sitting directly over the note's
+            // OWN bird graphic hid the exact thing the user needed to see to
+            // line it up. This is now a bare outline — no fill, no icon —
+            // so the real bird on the note stays fully visible inside it.
             return (
               <View style={[styles.birdBadge, {
-                borderColor: accent, backgroundColor: `${accent}22`,
+                borderColor: accent, backgroundColor: "transparent",
                 position: "absolute", left: `${cx}%`, top: `${cy}%`,
                 marginLeft: -42, marginTop: -42,
-              }]}>
-                <Text style={styles.birdIcon}>🦅</Text>
-              </View>
+              }]} />
             );
           })()}
         </NoteFrame>
@@ -1731,7 +1744,6 @@ const styles = StyleSheet.create({
     width: 84, height: 84, borderRadius: 42, borderWidth: 2,
     alignItems: "center", justifyContent: "center",
   },
-  birdIcon: { fontSize: 38 },
 
   // ── Bottom sheet ──
   sheet: {
