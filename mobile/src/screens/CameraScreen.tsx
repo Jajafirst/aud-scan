@@ -1480,12 +1480,24 @@ export function CameraScreen() {
         <TopBar step={1} onClose={() => { stopInterval(); setTorchOn(false); navigation.goBack(); }} />
 
         <NoteFrame>
-          {/* Not rotated. It was meant to demonstrate the tilt angle, but a
-              tilted icon next to a direction arrow was one confusing thing
-              too many — the arrow and label below already say what to do. */}
-          <View style={[styles.birdBadge, { borderColor: accent, backgroundColor: `${accent}22` }]}>
-            <Text style={styles.birdIcon}>🦅</Text>
-          </View>
+          {/* Positioned at the centre of the window zone — the same band the
+              bird check actually measures — rather than just the middle of
+              the frame, so this is a real target to line the note's own
+              bird graphic up against, not a decoration. */}
+          {(() => {
+            const win = zonesFor(denom).window;
+            const cx  = ((win.x0 + win.x1) / 2) * 100;
+            const cy  = ((win.y0 + win.y1) / 2) * 100;
+            return (
+              <View style={[styles.birdBadge, {
+                borderColor: accent, backgroundColor: `${accent}22`,
+                position: "absolute", left: `${cx}%`, top: `${cy}%`,
+                marginLeft: -42, marginTop: -42,
+              }]}>
+                <Text style={styles.birdIcon}>🦅</Text>
+              </View>
+            );
+          })()}
         </NoteFrame>
 
         <View style={styles.hintFloat} pointerEvents="none">
@@ -1505,6 +1517,7 @@ export function CameraScreen() {
           </View>
 
           <ProgressBar />
+          <Text style={styles.tip}>Line up the note's bird in the circle, then tilt</Text>
           <Text style={styles.tip}>{Math.round(progress * TARGET_FRAMES)}/{TARGET_FRAMES} captured</Text>
         </View>
       </View>
