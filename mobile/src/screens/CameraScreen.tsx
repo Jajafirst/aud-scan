@@ -324,16 +324,22 @@ function zoneChroma(img: tf.Tensor3D, denom: number | null, zone: Rect): number 
   return max.sub(min).mean().dataSync()[0];
 }
 
-// A cheap whole-frame thumbnail, used only to detect motion — is the note
-// moving right now, or has it stopped? This replaces every earlier attempt at
-// guessing that from a fixed timer (SETTLE_MS, the rocking animation, a tap
-// button): none of them could tell whether the user had actually finished
-// tilting, only how long it had been since a prompt appeared. Comparing two
-// real frames can.
-function frameThumbnail(raw: Uint8Array): Float32Array {
+// A cheap thumbnail of the NOTE FRAME ONLY, used to detect motion — is the
+// note moving right now, or has it stopped? This replaces every earlier
+// attempt at guessing that from a fixed timer (SETTLE_MS, the rocking
+// animation, a tap button): none of them could tell whether the user had
+// actually finished tilting, only how long it had been since a prompt
+// appeared. Comparing two real frames can — but only if it looks at the
+// note. The first version compared the WHOLE camera frame, so anything
+// moving in the background (an RGB keyboard cycling colours, in one report)
+// registered as motion forever and the phase could never reach "held
+// still," no matter how steady the note was. Same lesson as the zone crops
+// elsewhere in this file: measure the note, not the room.
+function frameThumbnail(raw: Uint8Array, denom: number | null): Float32Array {
   return tf.tidy(() => {
     const img   = decodeJpeg(raw, 3);
-    const small = tf.image.resizeBilinear(img, [MOTION_THUMB, MOTION_THUMB]).toFloat();
+    const note  = cropToNote(img, denom);
+    const small = tf.image.resizeBilinear(note, [MOTION_THUMB, MOTION_THUMB]).toFloat();
     const gray  = small.slice([0, 0, 0], [-1, -1, 1]).mul(0.299)
       .add(small.slice([0, 0, 1], [-1, -1, 1]).mul(0.587))
       .add(small.slice([0, 0, 2], [-1, -1, 1]).mul(0.114)).div(255);
@@ -750,7 +756,18 @@ export function CameraScreen() {
   // register as "already held" and capture immediately.
   const motionPrevThumb = useRef<Float32Array | null>(null);
   const motionSawMove   = useRef(false);
-  const resetMotion = () => { motionPrevThumb.current = null; motionSawMove.current = false; };
+  // Safety net: if motion never reads as settled — an unusually shaky grip,
+  // or a background the note-only crop still doesn't fully exclude — this
+  // caps how many polls one direction can wait before accepting whatever the
+  // current frame is anyway. Without it a stall here would hang the scan
+  // completely rather than just costing one lower-quality frame.
+  const motionStallRef = useRef(0);
+  const MOTION_STALL_LIMIT = 30; // ~30 * 280ms ≈ 8.4s per direction
+  const resetMotion = () => {
+    motionPrevThumb.current = null;
+    motionSawMove.current = false;
+    motionStallRef.current = 0;
+  };
   // Drives the on-screen status word. "move" = waiting for real movement,
   // "hold" = movement seen, now waiting for it to stop, "captured" = a frame
   // was just accepted (brief flash before the next direction).
@@ -912,16 +929,18 @@ export function CameraScreen() {
         if (!photo?.base64) return;
         const raw = Uint8Array.from(atob(photo.base64), c => c.charCodeAt(0));
 
-        const thumb = frameThumbnail(raw);
-        const motion = frameMotion(motionPrevThumb.current, thumb);
+        const thumb = frameThumbnail(raw, p1.current.denomination);
+        const motion  = frameMotion(motionPrevThumb.current, thumb);
+        const stalled = motionStallRef.current >= MOTION_STALL_LIMIT;
         motionPrevThumb.current = thumb;
+        motionStallRef.current += 1;
 
-        if (motion >= MOTION_MOVE_THRESHOLD) {
+        if (!stalled && motion >= MOTION_MOVE_THRESHOLD) {
           motionSawMove.current = true;
           setMotionStatus("move");
           return;
         }
-        if (motion >= MOTION_STILL_THRESHOLD || !motionSawMove.current) {
+        if (!stalled && (motion >= MOTION_STILL_THRESHOLD || !motionSawMove.current)) {
           setMotionStatus(motionSawMove.current ? "hold" : "move");
           return;
         }
@@ -1005,16 +1024,18 @@ export function CameraScreen() {
         if (!photo?.base64) return;
         const raw = Uint8Array.from(atob(photo.base64), c => c.charCodeAt(0));
 
-        const thumb = frameThumbnail(raw);
-        const motion = frameMotion(motionPrevThumb.current, thumb);
+        const thumb = frameThumbnail(raw, p1.current.denomination);
+        const motion  = frameMotion(motionPrevThumb.current, thumb);
+        const stalled = motionStallRef.current >= MOTION_STALL_LIMIT;
         motionPrevThumb.current = thumb;
+        motionStallRef.current += 1;
 
-        if (motion >= MOTION_MOVE_THRESHOLD) {
+        if (!stalled && motion >= MOTION_MOVE_THRESHOLD) {
           motionSawMove.current = true;
           setMotionStatus("move");
           return;
         }
-        if (motion >= MOTION_STILL_THRESHOLD || !motionSawMove.current) {
+        if (!stalled && (motion >= MOTION_STILL_THRESHOLD || !motionSawMove.current)) {
           setMotionStatus(motionSawMove.current ? "hold" : "move");
           return;
         }
@@ -1096,16 +1117,18 @@ export function CameraScreen() {
         if (!photo?.base64) return;
         const raw = Uint8Array.from(atob(photo.base64), c => c.charCodeAt(0));
 
-        const thumb = frameThumbnail(raw);
-        const motion = frameMotion(motionPrevThumb.current, thumb);
+        const thumb = frameThumbnail(raw, p1.current.denomination);
+        const motion  = frameMotion(motionPrevThumb.current, thumb);
+        const stalled = motionStallRef.current >= MOTION_STALL_LIMIT;
         motionPrevThumb.current = thumb;
+        motionStallRef.current += 1;
 
-        if (motion >= MOTION_MOVE_THRESHOLD) {
+        if (!stalled && motion >= MOTION_MOVE_THRESHOLD) {
           motionSawMove.current = true;
           setMotionStatus("move");
           return;
         }
-        if (motion >= MOTION_STILL_THRESHOLD || !motionSawMove.current) {
+        if (!stalled && (motion >= MOTION_STILL_THRESHOLD || !motionSawMove.current)) {
           setMotionStatus(motionSawMove.current ? "hold" : "move");
           return;
         }
