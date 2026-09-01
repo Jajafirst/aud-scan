@@ -255,6 +255,14 @@ const TILT_HINTS = [
   { arrow: "→", label: "TILT RIGHT" },
 ];
 
+// The angle the on-screen rocking icon demonstrates, and the number named in
+// the copy. Not a measured requirement — no gyroscope reading backs it — but
+// a concrete target beats "slowly" alone: three genuine scans in a row showed
+// front colour swing falling from 0.0566 to 0.0243 to 0.0134 right after the
+// setup screen told users to move slowly with no indication of how far. A
+// slow, shallow tilt is exactly what would produce that decline.
+const TILT_TARGET_DEG = 35;
+
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
   return Promise.race([p, new Promise<null>(r => setTimeout(() => r(null), ms))]);
 }
@@ -1341,10 +1349,15 @@ export function CameraScreen() {
         <TopBar step={1} onClose={() => { stopInterval(); setTorchOn(false); navigation.goBack(); }} />
 
         <NoteFrame>
+          {/* Demonstrates the target angle, not just the direction. At the old
+              +/-18deg it modelled a shallower tilt than the checks need — and
+              repeat genuine scans showed colour swing shrinking once users
+              were told to move "slowly" with nothing showing how far "slowly"
+              still had to go. This rotates as far as the note itself should. */}
           <Animated.View style={[styles.birdBadge, {
             borderColor: accent, backgroundColor: `${accent}22`,
             transform: [{ rotate: rockAnim.interpolate({
-              inputRange: [-1, 1], outputRange: ["-18deg", "18deg"],
+              inputRange: [-1, 1], outputRange: [`-${TILT_TARGET_DEG}deg`, `${TILT_TARGET_DEG}deg`],
             }) }],
           }]}>
             <Text style={styles.birdIcon}>🦅</Text>
@@ -1365,7 +1378,7 @@ export function CameraScreen() {
           <View style={styles.sheetHead}>
             <View style={{ flex: 1 }}>
               <Text style={styles.sheetTitle}>Flying Bird</Text>
-              <Text style={styles.sheetSub}>Rock the note slowly left and right</Text>
+              <Text style={styles.sheetSub}>Rock about {TILT_TARGET_DEG}° each way — follow the eagle</Text>
             </View>
             <View style={[styles.torchChip, { borderColor: accent }]}>
               <Text style={[styles.torchText, { color: accent }]}>⚡ FLASH ON</Text>
@@ -1386,7 +1399,7 @@ export function CameraScreen() {
           </View>
 
           <Text style={styles.tip}>
-            {settling ? "Rock the note to a new angle" : "Hold it there — capturing"}
+            {settling ? `Rock to about ${TILT_TARGET_DEG}° — like the eagle` : "Hold it there — capturing"}
             {"  ·  "}{Math.round(progress * TARGET_FRAMES)}/{TARGET_FRAMES}
           </Text>
         </View>
@@ -1430,8 +1443,8 @@ export function CameraScreen() {
                 <Text style={[styles.setupIconText, { color: accent }]}>3</Text>
               </View>
               <View style={{ flex: 1 }}>
-                <Text style={styles.setupHead}>Tilt slowly, not fast</Text>
-                <Text style={styles.setupBody}>When asked to tilt left or right, move the note over about a second — a quick flick is too fast to capture cleanly.</Text>
+                <Text style={styles.setupHead}>Tilt a real amount, not a wobble</Text>
+                <Text style={styles.setupBody}>Follow the note icon on screen — about {TILT_TARGET_DEG}° each way, over about a second. A small tilt won't catch the colour-shift effect at all.</Text>
               </View>
             </View>
           </View>
@@ -1521,6 +1534,17 @@ export function CameraScreen() {
           style={styles.zoneOviBand}
           label={isPhase2 ? "COLOUR-SHIFTING FEATURES" : "CLEAR WINDOW & COLOUR SHIFT"}
         />
+        {/* Same rocking demonstration as the bird step, at the same target
+            angle \u2014 the checks here read the same colour-shift effect, so the
+            motion that reveals it should look identical to the user. */}
+        <Animated.View style={[styles.tiltBadge, {
+          borderColor: accent, backgroundColor: `${accent}22`,
+          transform: [{ rotate: rockAnim.interpolate({
+            inputRange: [-1, 1], outputRange: [`-${TILT_TARGET_DEG}deg`, `${TILT_TARGET_DEG}deg`],
+          }) }],
+        }]}>
+          <Text style={styles.tiltBadgeText}>\uD83D\uDCB5</Text>
+        </Animated.View>
       </NoteFrame>
 
       <View style={styles.hintFloat} pointerEvents="none">
@@ -1528,7 +1552,7 @@ export function CameraScreen() {
           {settling ? TILT_HINTS[tiltHint].arrow : "\u25CF"}
         </Text>
         <Text style={[styles.hintLabel, { color: settling ? accent : "#4ADE80" }]}>
-          {settling ? TILT_HINTS[tiltHint].label : "HOLD STILL"}
+          {settling ? `${TILT_HINTS[tiltHint].label} ~${TILT_TARGET_DEG}\u00B0` : "HOLD STILL"}
         </Text>
       </View>
 
@@ -1537,7 +1561,7 @@ export function CameraScreen() {
           <View style={{ flex: 1 }}>
             <Text style={styles.sheetTitle}>{isPhase2 ? "Back Side" : "Front Side"}</Text>
             <Text style={styles.sheetSub}>
-              {isPhase2 ? "Tilt to reveal the optical features" : "Tilt to reveal the colour shift"}
+              Tilt about {TILT_TARGET_DEG}° each way — follow the note icon above
             </Text>
           </View>
           {serial ? (
@@ -1551,7 +1575,7 @@ export function CameraScreen() {
         <ProgressBar />
         <Text style={styles.tip}>
           {settling
-            ? `Tilt ${TILT_HINTS[tiltHint].label.replace("TILT ", "").toLowerCase()}`
+            ? `Tilt ${TILT_HINTS[tiltHint].label.replace("TILT ", "").toLowerCase()} — about ${TILT_TARGET_DEG}°, like the icon`
             : "Hold it there — capturing"}
           {"  ·  "}{Math.round(progress * TARGET_FRAMES)}/{TARGET_FRAMES}
         </Text>
@@ -1617,6 +1641,13 @@ const styles = StyleSheet.create({
   hintLabel: { fontSize: 12, fontWeight: "900", letterSpacing: 2.5, marginTop: 2 },
 
   // ── Bird badge ──
+  tiltBadge: {
+    position: "absolute", top: "8%", alignSelf: "center",
+    width: 56, height: 56, borderRadius: 28, borderWidth: 2,
+    alignItems: "center", justifyContent: "center",
+  },
+  tiltBadgeText: { fontSize: 24 },
+
   birdBadge: {
     width: 84, height: 84, borderRadius: 42, borderWidth: 2,
     alignItems: "center", justifyContent: "center",
