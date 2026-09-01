@@ -720,6 +720,14 @@ export function CameraScreen() {
   const busyRef = useRef(false);
   const settleUntilRef = useRef(0);
   const [settling, setSettling] = useState(false);
+  // Live readout of the SAME numbers that decide the verdict, so the on-screen
+  // feedback during a tilt is never a guess — it is exactly what the score
+  // will use. Before this, the only guidance was a demo icon to copy; there
+  // was no way to tell, while still holding the note, whether the motion just
+  // made had actually registered as a real change.
+  const [liveBirdStates, setLiveBirdStates] = useState(0);
+  const [liveSwing,      setLiveSwing]      = useState(0);   // front OVI, phase1
+  const [liveSwing2,     setLiveSwing2]     = useState(0);   // back OVI, phase2
 
   useEffect(() => { phaseRef.current = phase; }, [phase]);
 
@@ -863,6 +871,7 @@ export function CameraScreen() {
     birdRatio.current      = [];
     birdVariance.current   = [];
     birdPatches.current    = [];
+    setLiveBirdStates(0);
     setTorchOn(true);
     startRock();
     beginSettle();
@@ -899,6 +908,7 @@ export function CameraScreen() {
         birdRatio.current.push(b.ratio);
         birdVariance.current.push(b.variance);
         birdPatches.current.push(b.patch);
+        setLiveBirdStates(countDistinctStates(birdPatches.current, TH_PATCH_SAME));
         runMlDenomination(raw);
         beginSettle();
       } catch {} finally { busyRef.current = false; }
@@ -944,6 +954,7 @@ export function CameraScreen() {
     setPhase("phase1");
     setProgress(0);
     setTiltHint(0);
+    setLiveSwing(0);
     beginSettle();
     busyRef.current = false;
     const startTime = Date.now();
@@ -976,6 +987,7 @@ export function CameraScreen() {
         p1.current.winVars.push(f.winVar);
         p1.current.winRatios.push(f.bodyLuma > 0 ? f.winLuma / f.bodyLuma : 0);
         p1.current.colorToneFlags.push(f.colorTone);
+        setLiveSwing(range(p1.current.oviChromas));
         setTiltHint(h => (h + 1) % TILT_HINTS.length);
         beginSettle();
       } catch {} finally { busyRef.current = false; }
@@ -1023,6 +1035,7 @@ export function CameraScreen() {
     setPhase("phase2");
     setProgress(0);
     setTiltHint(0);
+    setLiveSwing2(0);
     beginSettle();
     busyRef.current = false;
     const startTime = Date.now();
@@ -1051,6 +1064,7 @@ export function CameraScreen() {
         p2.current.sharpnesses.push(f.sharpness);
         p2.current.details.push(f.detail);
         p2.current.numeralPatches.push(f.numeralPatch);
+        setLiveSwing2(range(p2.current.oviChromas));
         if (photo.uri && f.oviChroma > p2.current.bestChroma) {
           p2.current.bestChroma = f.oviChroma;
           p2.current.bestUri    = photo.uri;
@@ -1402,6 +1416,15 @@ export function CameraScreen() {
             {settling ? `Rock to about ${TILT_TARGET_DEG}° — like the eagle` : "Hold it there — capturing"}
             {"  ·  "}{Math.round(progress * TARGET_FRAMES)}/{TARGET_FRAMES}
           </Text>
+          {/* Live readout of the exact number the verdict uses — not a demo to
+              imitate, the real measurement from the frames just taken. */}
+          {birdPatches.current.length >= 2 && (
+            <Text style={[styles.liveReadout, { color: liveBirdStates >= TH_MIN_STATES ? "#4ADE80" : accent }]}>
+              {liveBirdStates >= TH_MIN_STATES
+                ? `✓ Good — ${liveBirdStates} distinct looks captured`
+                : `Tilt further — only ${liveBirdStates} distinct look${liveBirdStates === 1 ? "" : "s"} so far`}
+            </Text>
+          )}
         </View>
       </View>
     );
@@ -1579,6 +1602,22 @@ export function CameraScreen() {
             : "Hold it there — capturing"}
           {"  ·  "}{Math.round(progress * TARGET_FRAMES)}/{TARGET_FRAMES}
         </Text>
+        {/* Same live readout as the bird step, reading whichever side's swing
+            this phase is collecting — the actual number the score will use. */}
+        {(() => {
+          const swing = isPhase2 ? liveSwing2 : liveSwing;
+          const need  = isPhase2 ? TH_OVI_SWING_BACK : TH_OVI_SWING_FRONT;
+          const frames = isPhase2 ? p2.current.oviChromas.length : p1.current.oviChromas.length;
+          if (frames < 2) return null;
+          const good = swing >= need;
+          return (
+            <Text style={[styles.liveReadout, { color: good ? "#4ADE80" : accent }]}>
+              {good
+                ? `✓ Good — colour shift detected (${swing.toFixed(3)})`
+                : `Tilt further — barely any colour shift yet (${swing.toFixed(3)})`}
+            </Text>
+          );
+        })()}
         <CheckList items={isPhase2 ? checks.slice(5) : checks.slice(2, 5)} />
       </View>
     </View>
@@ -1707,6 +1746,7 @@ const styles = StyleSheet.create({
   torchText: { fontSize: 9, fontWeight: "900", letterSpacing: 1 },
 
   tip: { color: "rgba(255,255,255,0.35)", fontSize: 12, textAlign: "center", lineHeight: 17 },
+  liveReadout: { fontSize: 12, fontWeight: "700", textAlign: "center", marginTop: -4 },
 
   // ── Buttons ──
   btn:          { paddingVertical: 17, borderRadius: 14, alignItems: "center" },
