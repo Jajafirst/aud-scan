@@ -26,11 +26,18 @@ const FRAME_INTERVAL  = 300;   // fires often; a busy guard drops overlapping ca
 // Grace period after a prompt changes, before the next capture starts. Without
 // it the shutter fired the instant the arrow moved, so every frame caught the
 // note mid-swing between positions instead of held at one.
-// Time allowed to reach the requested position before a frame is taken. A
-// left-right rock arrives much sooner than the old up/down reach did, so this
-// came down with it. It still exists so frames are captured with the note
-// held, not mid-swing.
-const SETTLE_MS       = 1000;
+// Time allowed to reach the requested position before a frame is taken. It
+// exists so frames are captured with the note held, not mid-swing.
+//
+// This was cut to 1000ms on the assumption that a left-right rock arrives
+// faster than the old up/down reach. That held at the time, but a later
+// change asked for a much bigger tilt (TILT_TARGET_DEG, ~35°) without raising
+// this back — the user reported the screen switching to HOLD STILL before
+// they had physically finished tilting, and the data agreed: a genuine note
+// scored front swing 0.0179, below the 0.025 threshold, and the bird check
+// failed outright, both consistent with frames caught mid-motion rather than
+// held at the target angle. Back up to 1500ms to give the bigger motion room.
+const SETTLE_MS       = 1500;
 
 // Feature thresholds, from two scans of genuine $10 AK173948183 and one of
 // counterfeit AK173948185.
