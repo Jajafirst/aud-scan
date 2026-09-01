@@ -1416,13 +1416,15 @@ export function CameraScreen() {
             {settling ? `Rock to about ${TILT_TARGET_DEG}° — like the eagle` : "Hold it there — capturing"}
             {"  ·  "}{Math.round(progress * TARGET_FRAMES)}/{TARGET_FRAMES}
           </Text>
-          {/* Live readout of the exact number the verdict uses — not a demo to
-              imitate, the real measurement from the frames just taken. */}
-          {birdPatches.current.length >= 2 && (
+          {/* Live readout of the exact number the verdict uses. Shown only
+              while actively rocking (settling) — showing "tilt further" at
+              the same moment the big indicator says HOLD STILL told the user
+              two contradictory things at once. */}
+          {settling && birdPatches.current.length >= 2 && (
             <Text style={[styles.liveReadout, { color: liveBirdStates >= TH_MIN_STATES ? "#4ADE80" : accent }]}>
               {liveBirdStates >= TH_MIN_STATES
                 ? `✓ Good — ${liveBirdStates} distinct looks captured`
-                : `Tilt further — only ${liveBirdStates} distinct look${liveBirdStates === 1 ? "" : "s"} so far`}
+                : `Keep rocking — only ${liveBirdStates} distinct look${liveBirdStates === 1 ? "" : "s"} so far`}
             </Text>
           )}
         </View>
@@ -1552,22 +1554,17 @@ export function CameraScreen() {
 
       <TopBar step={isPhase2 ? 3 : 2} onClose={() => { stopInterval(); navigation.goBack(); }} />
 
+      {/* The rocking icon that was here duplicated the HOLD STILL indicator
+          below \u2014 both centred on the note, so the icon was hidden behind it
+          and the screen just looked like an empty circle. The big arrow +
+          label below already carries the direction and angle; removed rather
+          than fixing the overlap, since the note has a zone label and a
+          direction arrow already competing for attention in a small area. */}
       <NoteFrame>
         <Zone
           style={styles.zoneOviBand}
           label={isPhase2 ? "COLOUR-SHIFTING FEATURES" : "CLEAR WINDOW & COLOUR SHIFT"}
         />
-        {/* Same rocking demonstration as the bird step, at the same target
-            angle \u2014 the checks here read the same colour-shift effect, so the
-            motion that reveals it should look identical to the user. */}
-        <Animated.View style={[styles.tiltBadge, {
-          borderColor: accent, backgroundColor: `${accent}22`,
-          transform: [{ rotate: rockAnim.interpolate({
-            inputRange: [-1, 1], outputRange: [`-${TILT_TARGET_DEG}deg`, `${TILT_TARGET_DEG}deg`],
-          }) }],
-        }]}>
-          <Text style={styles.tiltBadgeText}>\uD83D\uDCB5</Text>
-        </Animated.View>
       </NoteFrame>
 
       <View style={styles.hintFloat} pointerEvents="none">
@@ -1598,13 +1595,17 @@ export function CameraScreen() {
         <ProgressBar />
         <Text style={styles.tip}>
           {settling
-            ? `Tilt ${TILT_HINTS[tiltHint].label.replace("TILT ", "").toLowerCase()} — about ${TILT_TARGET_DEG}°, like the icon`
+            ? `Tilt ${TILT_HINTS[tiltHint].label.replace("TILT ", "").toLowerCase()} — about ${TILT_TARGET_DEG}°`
             : "Hold it there — capturing"}
           {"  ·  "}{Math.round(progress * TARGET_FRAMES)}/{TARGET_FRAMES}
         </Text>
         {/* Same live readout as the bird step, reading whichever side's swing
-            this phase is collecting — the actual number the score will use. */}
+            this phase is collecting — the actual number the score will use.
+            Shown only while actively tilting (settling), not while the big
+            indicator above says HOLD STILL — showing both at once told the
+            user two contradictory things at the same time. */}
         {(() => {
+          if (!settling) return null;
           const swing = isPhase2 ? liveSwing2 : liveSwing;
           const need  = isPhase2 ? TH_OVI_SWING_BACK : TH_OVI_SWING_FRONT;
           const frames = isPhase2 ? p2.current.oviChromas.length : p1.current.oviChromas.length;
@@ -1614,7 +1615,7 @@ export function CameraScreen() {
             <Text style={[styles.liveReadout, { color: good ? "#4ADE80" : accent }]}>
               {good
                 ? `✓ Good — colour shift detected (${swing.toFixed(3)})`
-                : `Tilt further — barely any colour shift yet (${swing.toFixed(3)})`}
+                : `Keep tilting — barely any colour shift yet (${swing.toFixed(3)})`}
             </Text>
           );
         })()}
@@ -1680,13 +1681,6 @@ const styles = StyleSheet.create({
   hintLabel: { fontSize: 12, fontWeight: "900", letterSpacing: 2.5, marginTop: 2 },
 
   // ── Bird badge ──
-  tiltBadge: {
-    position: "absolute", top: "8%", alignSelf: "center",
-    width: 56, height: 56, borderRadius: 28, borderWidth: 2,
-    alignItems: "center", justifyContent: "center",
-  },
-  tiltBadgeText: { fontSize: 24 },
-
   birdBadge: {
     width: 84, height: 84, borderRadius: 42, borderWidth: 2,
     alignItems: "center", justifyContent: "center",
