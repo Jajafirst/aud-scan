@@ -15,13 +15,20 @@ import { decodeJpeg } from "@tensorflow/tfjs-react-native";
 const MODEL_URL       = "https://teachablemachine.withgoogle.com/models/Z11VY1264/";
 const DENOM_THRESHOLD = 0.35;
 const PASS_THRESHOLD  = 0.80;
-// Bird/tilt phases used to run on a timer that GUESSED when the user had
-// finished moving — first tuned for a small motion, then a bigger target
+// Bird/tilt phases used to run on a fixed timer that GUESSED when the user
+// had finished moving — tuned once for a small motion, then a bigger target
 // angle was asked for without the wait time following, and the screen said
-// HOLD STILL before the user had physically finished tilting. A timer can
-// only ever guess this; it was replaced with a button the user taps when
-// they are actually in position, so capture timing is never wrong again.
-// Phases still stop once every direction has contributed a frame.
+// HOLD STILL before the user had physically finished tilting. A manual
+// capture button fixed the timing but asked the user to notice a UI state
+// and tap at the right moment, which is its own kind of friction.
+//
+// Capture is now fully automatic, driven by watching the camera feed itself:
+// every poll compares this frame to the last one (frameMotion). The phase
+// waits for real movement, then waits for it to stop, then captures — no
+// clock involved, so it can't fire too early, and no button to notice either.
+const MOTION_THUMB          = 16;   // thumbnail side, pixels — cheap on purpose
+const MOTION_MOVE_THRESHOLD = 0.05; // above this, frame-to-frame, counts as "moving"
+const MOTION_STILL_THRESHOLD = 0.02; // below this counts as "held still"
 const TARGET_FRAMES   = 4;     // one per tilt direction
 
 // Feature thresholds, from two scans of genuine $10 AK173948183 and one of
@@ -315,6 +322,33 @@ function zoneChroma(img: tf.Tensor3D, denom: number | null, zone: Rect): number 
   const max = r.maximum(g).maximum(b);
   const min = r.minimum(g).minimum(b);
   return max.sub(min).mean().dataSync()[0];
+}
+
+// A cheap whole-frame thumbnail, used only to detect motion — is the note
+// moving right now, or has it stopped? This replaces every earlier attempt at
+// guessing that from a fixed timer (SETTLE_MS, the rocking animation, a tap
+// button): none of them could tell whether the user had actually finished
+// tilting, only how long it had been since a prompt appeared. Comparing two
+// real frames can.
+function frameThumbnail(raw: Uint8Array): Float32Array {
+  return tf.tidy(() => {
+    const img   = decodeJpeg(raw, 3);
+    const small = tf.image.resizeBilinear(img, [MOTION_THUMB, MOTION_THUMB]).toFloat();
+    const gray  = small.slice([0, 0, 0], [-1, -1, 1]).mul(0.299)
+      .add(small.slice([0, 0, 1], [-1, -1, 1]).mul(0.587))
+      .add(small.slice([0, 0, 2], [-1, -1, 1]).mul(0.114)).div(255);
+    return gray.dataSync() as Float32Array;
+  });
+}
+
+// Mean per-pixel difference between two thumbnails, 0 (identical) to 1
+// (completely different). No prior frame counts as maximum motion, so the
+// very first poll of a phase never accidentally reads as "already still."
+function frameMotion(prev: Float32Array | null, next: Float32Array): number {
+  if (!prev || prev.length !== next.length) return 1;
+  let sum = 0;
+  for (let i = 0; i < next.length; i++) sum += Math.abs(prev[i] - next[i]);
+  return sum / next.length;
 }
 
 // One zone reduced to a contrast-normalised patch. Normalising means the
@@ -709,22 +743,19 @@ export function CameraScreen() {
   const birdVariance   = useRef<number[]>([]);
   const birdPatches    = useRef<number[][]>([]);
   const busyRef = useRef(false);
-  // Replaces a timer that guessed when the user had finished tilting. It
-  // guessed wrong more than once: SETTLE_MS was tuned for a small motion,
-  // then the target tilt got bigger (TILT_TARGET_DEG) without the wait time
-  // following, and the screen said HOLD STILL before the user had physically
-  // gotten there. Capture is now user-triggered — the app can never be wrong
-  // about whether you have finished moving, because you are the one who
-  // decides that by tapping.
-  const [capturing, setCapturing] = useState(false);
-  // Live readout of the SAME numbers that decide the verdict, so the on-screen
-  // feedback during a tilt is never a guess — it is exactly what the score
-  // will use. Before this, the only guidance was a demo icon to copy; there
-  // was no way to tell, while still holding the note, whether the motion just
-  // made had actually registered as a real change.
-  const [liveBirdStates, setLiveBirdStates] = useState(0);
-  const [liveSwing,      setLiveSwing]      = useState(0);   // front OVI, phase1
-  const [liveSwing2,     setLiveSwing2]     = useState(0);   // back OVI, phase2
+  // Motion state shared across the bird/front/back phases. prevThumb is last
+  // poll's frame, for comparison; sawMove must go true (real movement seen)
+  // before a still reading is allowed to trigger a capture — otherwise a
+  // frame that simply never moved (e.g. right at the start of a phase) would
+  // register as "already held" and capture immediately.
+  const motionPrevThumb = useRef<Float32Array | null>(null);
+  const motionSawMove   = useRef(false);
+  const resetMotion = () => { motionPrevThumb.current = null; motionSawMove.current = false; };
+  // Drives the on-screen status word. "move" = waiting for real movement,
+  // "hold" = movement seen, now waiting for it to stop, "captured" = a frame
+  // was just accepted (brief flash before the next direction).
+  const [motionStatus, setMotionStatus] = useState<"move" | "hold" | "captured">("move");
+
 
   useEffect(() => { phaseRef.current = phase; }, [phase]);
 
@@ -850,45 +881,66 @@ export function CameraScreen() {
     setPhase("bird");
     setProgress(0);
     setTiltHint(0);
+    setMotionStatus("move");
+    resetMotion();
     // Clear last scan's samples — these refs outlive a single scan, so without
     // this a second scan without remounting would average in the first note.
     birdBrightness.current = [];
     birdRatio.current      = [];
     birdVariance.current   = [];
     birdPatches.current    = [];
-    setLiveBirdStates(0);
     setTorchOn(true);
     busyRef.current = false;
-  };
 
-  const captureBirdFrame = async () => {
-    if (!cameraRef.current || busyRef.current) return;
-    busyRef.current = true;
-    setCapturing(true);
-    try {
-      // This step only needs the mean brightness of the window zone, which
-      // survives heavy compression, so capture cheaply and finish sooner.
-      const photo = await cameraRef.current.takePictureAsync({
-        base64: true, quality: 0.2, skipProcessing: true, shutterSound: false,
-      });
-      if (!photo?.base64) return;
-      const raw = Uint8Array.from(atob(photo.base64), c => c.charCodeAt(0));
-      const b = analyzeBirdFrame(raw, p1.current.denomination);
-      birdBrightness.current.push(b.brightness);
-      birdRatio.current.push(b.ratio);
-      birdVariance.current.push(b.variance);
-      birdPatches.current.push(b.patch);
-      setLiveBirdStates(countDistinctStates(birdPatches.current, TH_PATCH_SAME));
-      runMlDenomination(raw);
-
+    // Every poll uses the SAME photo for both the motion check and, once
+    // stillness is confirmed, the real measurement — one capture per tick,
+    // not two, so this costs nothing extra over the earlier timer version.
+    intervalRef.current = setInterval(async () => {
       const done = birdPatches.current.length;
-      setProgress(Math.min(done / TARGET_FRAMES, 1));
-      setTiltHint(h => (h + 1) % TILT_HINTS.length);
       if (done >= TARGET_FRAMES) {
+        stopInterval();
         setTorchOn(false);
         finalizeBird();
+        return;
       }
-    } catch {} finally { busyRef.current = false; setCapturing(false); }
+      if (!cameraRef.current || busyRef.current) return;
+      busyRef.current = true;
+      try {
+        const photo = await cameraRef.current.takePictureAsync({
+          base64: true, quality: 0.2, skipProcessing: true, shutterSound: false,
+        });
+        if (!photo?.base64) return;
+        const raw = Uint8Array.from(atob(photo.base64), c => c.charCodeAt(0));
+
+        const thumb = frameThumbnail(raw);
+        const motion = frameMotion(motionPrevThumb.current, thumb);
+        motionPrevThumb.current = thumb;
+
+        if (motion >= MOTION_MOVE_THRESHOLD) {
+          motionSawMove.current = true;
+          setMotionStatus("move");
+          return;
+        }
+        if (motion >= MOTION_STILL_THRESHOLD || !motionSawMove.current) {
+          setMotionStatus(motionSawMove.current ? "hold" : "move");
+          return;
+        }
+
+        // Held still after real movement — accept this frame.
+        const b = analyzeBirdFrame(raw, p1.current.denomination);
+        birdBrightness.current.push(b.brightness);
+        birdRatio.current.push(b.ratio);
+        birdVariance.current.push(b.variance);
+        birdPatches.current.push(b.patch);
+        runMlDenomination(raw);
+
+        const next = birdPatches.current.length;
+        setProgress(Math.min(next / TARGET_FRAMES, 1));
+        setMotionStatus("captured");
+        resetMotion(); // must see fresh movement before the next side counts
+        setTiltHint(h => (h + 1) % TILT_HINTS.length);
+      } catch {} finally { busyRef.current = false; }
+    }, 280);
   };
 
   const finalizeBird = () => {
@@ -930,38 +982,57 @@ export function CameraScreen() {
     setPhase("phase1");
     setProgress(0);
     setTiltHint(0);
-    setLiveSwing(0);
+    setMotionStatus("move");
+    resetMotion();
     busyRef.current = false;
-  };
 
-  const capturePhase1Frame = async () => {
-    if (!cameraRef.current || busyRef.current) return;
-    busyRef.current = true;
-    setCapturing(true);
-    try {
-      // Chroma and region variance tolerate compression; only the sharpness
-      // measure in phase 2 needs full detail.
-      const photo = await cameraRef.current.takePictureAsync({
-        base64: true, quality: 0.4, skipProcessing: true, shutterSound: false,
-      });
-      if (!photo?.base64) return;
-      const raw = Uint8Array.from(atob(photo.base64), c => c.charCodeAt(0));
-      runMlDenomination(raw);
-      const f = analyzePhase1Frame(raw, p1.current.denomination);
-      p1.current.oviChromas.push(f.oviChroma);
-      p1.current.winVars.push(f.winVar);
-      p1.current.winRatios.push(f.bodyLuma > 0 ? f.winLuma / f.bodyLuma : 0);
-      p1.current.colorToneFlags.push(f.colorTone);
-      setLiveSwing(range(p1.current.oviChromas));
-
+    intervalRef.current = setInterval(async () => {
       const done = p1.current.oviChromas.length;
-      setProgress(Math.min(done / TARGET_FRAMES, 1));
-      setTiltHint(h => (h + 1) % TILT_HINTS.length);
       if (done >= TARGET_FRAMES) {
+        stopInterval();
         finalizePhase1();
         setPhase("flip");
+        return;
       }
-    } catch {} finally { busyRef.current = false; setCapturing(false); }
+      if (!cameraRef.current || busyRef.current) return;
+      busyRef.current = true;
+      try {
+        // Chroma and region variance tolerate compression; only the sharpness
+        // measure in phase 2 needs full detail.
+        const photo = await cameraRef.current.takePictureAsync({
+          base64: true, quality: 0.4, skipProcessing: true, shutterSound: false,
+        });
+        if (!photo?.base64) return;
+        const raw = Uint8Array.from(atob(photo.base64), c => c.charCodeAt(0));
+
+        const thumb = frameThumbnail(raw);
+        const motion = frameMotion(motionPrevThumb.current, thumb);
+        motionPrevThumb.current = thumb;
+
+        if (motion >= MOTION_MOVE_THRESHOLD) {
+          motionSawMove.current = true;
+          setMotionStatus("move");
+          return;
+        }
+        if (motion >= MOTION_STILL_THRESHOLD || !motionSawMove.current) {
+          setMotionStatus(motionSawMove.current ? "hold" : "move");
+          return;
+        }
+
+        runMlDenomination(raw);
+        const f = analyzePhase1Frame(raw, p1.current.denomination);
+        p1.current.oviChromas.push(f.oviChroma);
+        p1.current.winVars.push(f.winVar);
+        p1.current.winRatios.push(f.bodyLuma > 0 ? f.winLuma / f.bodyLuma : 0);
+        p1.current.colorToneFlags.push(f.colorTone);
+
+        const next = p1.current.oviChromas.length;
+        setProgress(Math.min(next / TARGET_FRAMES, 1));
+        setMotionStatus("captured");
+        resetMotion();
+        setTiltHint(h => (h + 1) % TILT_HINTS.length);
+      } catch {} finally { busyRef.current = false; }
+    }, 280);
   };
 
   const finalizePhase1 = () => {
@@ -1005,38 +1076,59 @@ export function CameraScreen() {
     setPhase("phase2");
     setProgress(0);
     setTiltHint(0);
-    setLiveSwing2(0);
+    setMotionStatus("move");
+    resetMotion();
     busyRef.current = false;
-  };
 
-  const capturePhase2Frame = async () => {
-    if (!cameraRef.current || busyRef.current) return;
-    busyRef.current = true;
-    setCapturing(true);
-    try {
-      const photo = await cameraRef.current.takePictureAsync({
-        base64: true, quality: 0.7, skipProcessing: true, shutterSound: false,
-      });
-      if (!photo?.base64) return;
-      const raw = Uint8Array.from(atob(photo.base64), c => c.charCodeAt(0));
-      const f = analyzePhase2Frame(raw, p1.current.denomination);
-      p2.current.oviChromas.push(f.oviChroma);
-      p2.current.sharpnesses.push(f.sharpness);
-      p2.current.details.push(f.detail);
-      p2.current.numeralPatches.push(f.numeralPatch);
-      setLiveSwing2(range(p2.current.oviChromas));
-      if (photo.uri && f.oviChroma > p2.current.bestChroma) {
-        p2.current.bestChroma = f.oviChroma;
-        p2.current.bestUri    = photo.uri;
-        p2.current.bestW      = photo.width  ?? 0;
-        p2.current.bestH      = photo.height ?? 0;
-      }
-
+    intervalRef.current = setInterval(async () => {
       const done = p2.current.sharpnesses.length;
-      setProgress(Math.min(done / TARGET_FRAMES, 1));
-      setTiltHint(h => (h + 1) % TILT_HINTS.length);
-      if (done >= TARGET_FRAMES) await finalizePhase2();
-    } catch {} finally { busyRef.current = false; setCapturing(false); }
+      if (done >= TARGET_FRAMES) {
+        stopInterval();
+        await finalizePhase2();
+        return;
+      }
+      if (!cameraRef.current || busyRef.current) return;
+      busyRef.current = true;
+      try {
+        const photo = await cameraRef.current.takePictureAsync({
+          base64: true, quality: 0.7, skipProcessing: true, shutterSound: false,
+        });
+        if (!photo?.base64) return;
+        const raw = Uint8Array.from(atob(photo.base64), c => c.charCodeAt(0));
+
+        const thumb = frameThumbnail(raw);
+        const motion = frameMotion(motionPrevThumb.current, thumb);
+        motionPrevThumb.current = thumb;
+
+        if (motion >= MOTION_MOVE_THRESHOLD) {
+          motionSawMove.current = true;
+          setMotionStatus("move");
+          return;
+        }
+        if (motion >= MOTION_STILL_THRESHOLD || !motionSawMove.current) {
+          setMotionStatus(motionSawMove.current ? "hold" : "move");
+          return;
+        }
+
+        const f = analyzePhase2Frame(raw, p1.current.denomination);
+        p2.current.oviChromas.push(f.oviChroma);
+        p2.current.sharpnesses.push(f.sharpness);
+        p2.current.details.push(f.detail);
+        p2.current.numeralPatches.push(f.numeralPatch);
+        if (photo.uri && f.oviChroma > p2.current.bestChroma) {
+          p2.current.bestChroma = f.oviChroma;
+          p2.current.bestUri    = photo.uri;
+          p2.current.bestW      = photo.width  ?? 0;
+          p2.current.bestH      = photo.height ?? 0;
+        }
+
+        const next = p2.current.sharpnesses.length;
+        setProgress(Math.min(next / TARGET_FRAMES, 1));
+        setMotionStatus("captured");
+        resetMotion();
+        setTiltHint(h => (h + 1) % TILT_HINTS.length);
+      } catch {} finally { busyRef.current = false; }
+    }, 280);
   };
 
   const finalizePhase2 = async () => {
@@ -1189,6 +1281,14 @@ export function CameraScreen() {
   };
 
   // ─── Shared pieces ───────────────────────────────────────────────────────
+  // The only status text on the bird/tilt screens — three short states, no
+  // instructions to read, since capture is automatic and needs none.
+  const MotionStatusLine = ({ status, accent }: { status: "move" | "hold" | "captured"; accent: string }) => (
+    <Text style={[styles.sheetSub, { color: status === "captured" ? "#4ADE80" : accent, fontWeight: "700" }]}>
+      {status === "move" ? "Move the note there…" : status === "hold" ? "Hold it…" : "✓ Captured"}
+    </Text>
+  );
+
   const StepDots = ({ active }: { active: number }) => (
     <View style={styles.dots}>
       {[0, 1, 2, 3].map(i => (
@@ -1326,11 +1426,9 @@ export function CameraScreen() {
         <TopBar step={1} onClose={() => { stopInterval(); setTorchOn(false); navigation.goBack(); }} />
 
         <NoteFrame>
-          {/* Static, not animated. A continuously rocking icon with no fixed
-              relationship to when the photo is actually taken was the source
-              of "I don't understand how to follow it". This shows the ONE
-              position to hold the note at right now: tilted the direction
-              named below, held there until you tap Capture. */}
+          {/* Static, not animated — nothing to "follow". Shows the one
+              position to hold the note at; the app watches the camera and
+              captures on its own the moment it sees you get there and stop. */}
           <View style={[styles.birdBadge, {
             borderColor: accent, backgroundColor: `${accent}22`,
             transform: [{ rotate: `${tiltHint === 0 ? -TILT_TARGET_DEG : TILT_TARGET_DEG}deg` }],
@@ -1341,14 +1439,14 @@ export function CameraScreen() {
 
         <View style={styles.hintFloat} pointerEvents="none">
           <Text style={[styles.hintArrow, { color: accent }]}>{dir.arrow}</Text>
-          <Text style={[styles.hintLabel, { color: accent }]}>{dir.label} ~{TILT_TARGET_DEG}°</Text>
+          <Text style={[styles.hintLabel, { color: accent }]}>{dir.label}</Text>
         </View>
 
         <View style={styles.sheet}>
           <View style={styles.sheetHead}>
             <View style={{ flex: 1 }}>
               <Text style={styles.sheetTitle}>Flying Bird</Text>
-              <Text style={styles.sheetSub}>Tilt the note the way shown, then tap the button below</Text>
+              <MotionStatusLine status={motionStatus} accent={accent} />
             </View>
             <View style={[styles.torchChip, { borderColor: accent }]}>
               <Text style={[styles.torchText, { color: accent }]}>⚡ FLASH ON</Text>
@@ -1357,26 +1455,6 @@ export function CameraScreen() {
 
           <ProgressBar />
           <Text style={styles.tip}>{Math.round(progress * TARGET_FRAMES)}/{TARGET_FRAMES} captured</Text>
-
-          {/* Live readout of the exact number the verdict uses. There is no
-              separate "hold still" moment anymore for it to contradict. */}
-          {birdPatches.current.length >= 2 && (
-            <Text style={[styles.liveReadout, { color: liveBirdStates >= TH_MIN_STATES ? "#4ADE80" : accent }]}>
-              {liveBirdStates >= TH_MIN_STATES
-                ? `✓ Good — ${liveBirdStates} distinct looks captured`
-                : `Try a bigger tilt next — only ${liveBirdStates} distinct look${liveBirdStates === 1 ? "" : "s"} so far`}
-            </Text>
-          )}
-
-          <TouchableOpacity
-            style={[styles.btn, styles.btnWide, { backgroundColor: accent, opacity: capturing ? 0.6 : 1 }]}
-            onPress={captureBirdFrame}
-            disabled={capturing}
-          >
-            {capturing
-              ? <ActivityIndicator size="small" color="#000" />
-              : <Text style={styles.btnText}>I\'M TILTED — CAPTURE</Text>}
-          </TouchableOpacity>
         </View>
       </View>
     );
@@ -1418,7 +1496,7 @@ export function CameraScreen() {
               </View>
               <View style={{ flex: 1 }}>
                 <Text style={styles.setupHead}>Tilt a real amount, not a wobble</Text>
-                <Text style={styles.setupBody}>Follow the note icon on screen — about {TILT_TARGET_DEG}° each way, over about a second. A small tilt won't catch the colour-shift effect at all.</Text>
+                <Text style={styles.setupBody}>The app captures on its own — no tapping. Just tilt the note the way the arrow shows and hold it a moment; a small wobble won't catch the colour-shift effect at all.</Text>
               </View>
             </View>
           </View>
@@ -1496,7 +1574,6 @@ export function CameraScreen() {
 
   // ─── STEP 3 / 4: TILT SCANS ──────────────────────────────────────────────
   const isPhase2 = phase === "phase2";
-  const capturePhaseFrame = isPhase2 ? capturePhase2Frame : capturePhase1Frame;
   return (
     <View style={styles.root}>
       <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" onCameraReady={onCameraReady} />
@@ -1511,18 +1588,19 @@ export function CameraScreen() {
         />
       </NoteFrame>
 
-      {/* Static direction indicator, matching the bird step: one position to
-          hold the note at, held until the button below is tapped. */}
+      {/* Static direction indicator: one position to hold the note at. No tap
+          needed — the app watches the camera and captures on its own once it
+          sees the note get there and stop moving. */}
       <View style={styles.hintFloat} pointerEvents="none">
         <Text style={[styles.hintArrow, { color: accent }]}>{TILT_HINTS[tiltHint].arrow}</Text>
-        <Text style={[styles.hintLabel, { color: accent }]}>{TILT_HINTS[tiltHint].label} ~{TILT_TARGET_DEG}°</Text>
+        <Text style={[styles.hintLabel, { color: accent }]}>{TILT_HINTS[tiltHint].label}</Text>
       </View>
 
       <View style={styles.sheet}>
         <View style={styles.sheetHead}>
           <View style={{ flex: 1 }}>
             <Text style={styles.sheetTitle}>{isPhase2 ? "Back Side" : "Front Side"}</Text>
-            <Text style={styles.sheetSub}>Tilt the note the way shown, then tap the button below</Text>
+            <MotionStatusLine status={motionStatus} accent={accent} />
           </View>
           {serial ? (
             <View style={styles.serialTag}>
@@ -1534,33 +1612,6 @@ export function CameraScreen() {
 
         <ProgressBar />
         <Text style={styles.tip}>{Math.round(progress * TARGET_FRAMES)}/{TARGET_FRAMES} captured</Text>
-
-        {/* Live readout of the exact number the verdict uses. No separate
-            "hold still" state exists here anymore for it to contradict. */}
-        {(() => {
-          const swing = isPhase2 ? liveSwing2 : liveSwing;
-          const need  = isPhase2 ? TH_OVI_SWING_BACK : TH_OVI_SWING_FRONT;
-          const frames = isPhase2 ? p2.current.oviChromas.length : p1.current.oviChromas.length;
-          if (frames < 2) return null;
-          const good = swing >= need;
-          return (
-            <Text style={[styles.liveReadout, { color: good ? "#4ADE80" : accent }]}>
-              {good
-                ? `✓ Good — colour shift detected (${swing.toFixed(3)})`
-                : `Try a bigger tilt next — barely any colour shift yet (${swing.toFixed(3)})`}
-            </Text>
-          );
-        })()}
-
-        <TouchableOpacity
-          style={[styles.btn, styles.btnWide, { backgroundColor: accent, opacity: capturing ? 0.6 : 1 }]}
-          onPress={capturePhaseFrame}
-          disabled={capturing}
-        >
-          {capturing
-            ? <ActivityIndicator size="small" color="#000" />
-            : <Text style={styles.btnText}>I\'M TILTED — CAPTURE</Text>}
-        </TouchableOpacity>
 
         <CheckList items={isPhase2 ? checks.slice(5) : checks.slice(2, 5)} />
       </View>
@@ -1675,7 +1726,6 @@ const styles = StyleSheet.create({
   torchText: { fontSize: 9, fontWeight: "900", letterSpacing: 1 },
 
   tip: { color: "rgba(255,255,255,0.35)", fontSize: 12, textAlign: "center", lineHeight: 17 },
-  liveReadout: { fontSize: 12, fontWeight: "700", textAlign: "center", marginTop: -4 },
 
   // ── Buttons ──
   btn:          { paddingVertical: 17, borderRadius: 14, alignItems: "center" },
