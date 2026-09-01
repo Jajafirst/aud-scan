@@ -768,28 +768,39 @@ export function CameraScreen() {
   const birdVariance   = useRef<number[]>([]);
   const birdPatches    = useRef<number[][]>([]);
   const busyRef = useRef(false);
-  // Motion state shared across the bird/front/back phases. prevThumb is last
-  // poll's frame, for comparison; sawMove must go true (real movement seen)
-  // before a still reading is allowed to trigger a capture — otherwise a
-  // frame that simply never moved (e.g. right at the start of a phase) would
-  // register as "already held" and capture immediately.
-  const motionPrevThumb = useRef<Float32Array | null>(null);
-  const motionSawMove   = useRef(false);
-  // Safety net: if motion never reads as settled — an unusually shaky grip,
-  // or a background the note-only crop still doesn't fully exclude — this
-  // caps how many polls one direction can wait before accepting whatever the
-  // current frame is anyway. Without it a stall here would hang the scan
-  // completely rather than just costing one lower-quality frame.
+  // Simplified from an earlier version that required an active tilt-away
+  // motion before it would even start counting toward a capture — reported
+  // as slow and demanding to actually use. This is closer to what was asked
+  // for directly: line the circle up on the note's feature and hold it
+  // there; after DWELL_STILL_TICKS consecutive still polls (about three
+  // seconds), it captures on its own. No separate "prove you moved first"
+  // step.
+  //
+  // lastAcceptedThumb still guards against capturing the SAME position twice
+  // in a row — without it, someone who doesn't actually move between the two
+  // tilt directions would get two near-identical frames, which is useless
+  // for a check that measures the difference between them. The first frame
+  // of a phase has nothing to compare against yet, so it always passes.
+  const motionPrevThumb     = useRef<Float32Array | null>(null);
+  const lastAcceptedThumb   = useRef<Float32Array | null>(null);
+  const stillStreak         = useRef(0);
+  const DWELL_STILL_TICKS   = 10; // ~10 * 300ms = 3s of continuous stillness
+  const MIN_DIFF_FROM_LAST  = 0.03; // must look at least this different from the last accepted frame
+  // Safety net: if this direction never both dwells AND looks different
+  // enough from the last one — an unusually shaky grip, or someone genuinely
+  // not moving between directions — this caps how long one direction waits
+  // before accepting whatever it has anyway, rather than hanging the scan.
   const motionStallRef = useRef(0);
   const MOTION_STALL_LIMIT = 27; // ~27 * 300ms ≈ 8s per direction
   const resetMotion = () => {
     motionPrevThumb.current = null;
-    motionSawMove.current = false;
+    stillStreak.current = 0;
     motionStallRef.current = 0;
   };
-  // Drives the on-screen status word. "move" = waiting for real movement,
-  // "hold" = movement seen, now waiting for it to stop, "captured" = a frame
-  // was just accepted (brief flash before the next direction).
+  // Drives the on-screen status word. "move" = not settled yet (either still
+  // moving, or dwelling long enough but looking too similar to the last
+  // capture), "hold" = counting down the 3-second dwell, "captured" = a
+  // frame was just accepted.
   const [motionStatus, setMotionStatus] = useState<"move" | "hold" | "captured">("move");
 
 
@@ -919,6 +930,7 @@ export function CameraScreen() {
     setTiltHint(0);
     setMotionStatus("move");
     resetMotion();
+    lastAcceptedThumb.current = null; // fresh phase — nothing to differ from yet
     // Clear last scan's samples — these refs outlive a single scan, so without
     // this a second scan without remounting would average in the first note.
     birdBrightness.current = [];
@@ -954,15 +966,22 @@ export function CameraScreen() {
         motionPrevThumb.current = thumb;
         motionStallRef.current += 1;
 
-        if (!stalled && motion >= MOTION_MOVE_THRESHOLD) {
-          motionSawMove.current = true;
+        if (!stalled && motion >= MOTION_STILL_THRESHOLD) {
+          stillStreak.current = 0;
           setMotionStatus("move");
           return;
         }
-        if (!stalled && (motion >= MOTION_STILL_THRESHOLD || !motionSawMove.current)) {
-          setMotionStatus(motionSawMove.current ? "hold" : "move");
+        stillStreak.current += 1;
+        const dwelled = stillStreak.current >= DWELL_STILL_TICKS;
+        const diffFromLast = lastAcceptedThumb.current ? frameMotion(lastAcceptedThumb.current, thumb) : 1;
+        const looksNew = diffFromLast >= MIN_DIFF_FROM_LAST;
+        if (!stalled && !(dwelled && looksNew)) {
+          // Dwelled the full 3s but still looks like the last accepted
+          // frame — nudge back to "move" rather than capturing a duplicate.
+          setMotionStatus(dwelled ? "move" : "hold");
           return;
         }
+        lastAcceptedThumb.current = thumb;
 
         // Held still after real movement — accept this frame.
         const b = analyzeBirdFrame(raw, p1.current.denomination);
@@ -1022,6 +1041,7 @@ export function CameraScreen() {
     setTiltHint(0);
     setMotionStatus("move");
     resetMotion();
+    lastAcceptedThumb.current = null; // fresh phase — nothing to differ from yet
     busyRef.current = false;
 
     intervalRef.current = setInterval(async () => {
@@ -1055,15 +1075,22 @@ export function CameraScreen() {
         motionPrevThumb.current = thumb;
         motionStallRef.current += 1;
 
-        if (!stalled && motion >= MOTION_MOVE_THRESHOLD) {
-          motionSawMove.current = true;
+        if (!stalled && motion >= MOTION_STILL_THRESHOLD) {
+          stillStreak.current = 0;
           setMotionStatus("move");
           return;
         }
-        if (!stalled && (motion >= MOTION_STILL_THRESHOLD || !motionSawMove.current)) {
-          setMotionStatus(motionSawMove.current ? "hold" : "move");
+        stillStreak.current += 1;
+        const dwelled = stillStreak.current >= DWELL_STILL_TICKS;
+        const diffFromLast = lastAcceptedThumb.current ? frameMotion(lastAcceptedThumb.current, thumb) : 1;
+        const looksNew = diffFromLast >= MIN_DIFF_FROM_LAST;
+        if (!stalled && !(dwelled && looksNew)) {
+          // Dwelled the full 3s but still looks like the last accepted
+          // frame — nudge back to "move" rather than capturing a duplicate.
+          setMotionStatus(dwelled ? "move" : "hold");
           return;
         }
+        lastAcceptedThumb.current = thumb;
 
         runMlDenomination(raw);
         const f = analyzePhase1Frame(raw, p1.current.denomination);
@@ -1124,6 +1151,7 @@ export function CameraScreen() {
     setTiltHint(0);
     setMotionStatus("move");
     resetMotion();
+    lastAcceptedThumb.current = null; // fresh phase — nothing to differ from yet
     busyRef.current = false;
 
     intervalRef.current = setInterval(async () => {
@@ -1153,15 +1181,22 @@ export function CameraScreen() {
         motionPrevThumb.current = thumb;
         motionStallRef.current += 1;
 
-        if (!stalled && motion >= MOTION_MOVE_THRESHOLD) {
-          motionSawMove.current = true;
+        if (!stalled && motion >= MOTION_STILL_THRESHOLD) {
+          stillStreak.current = 0;
           setMotionStatus("move");
           return;
         }
-        if (!stalled && (motion >= MOTION_STILL_THRESHOLD || !motionSawMove.current)) {
-          setMotionStatus(motionSawMove.current ? "hold" : "move");
+        stillStreak.current += 1;
+        const dwelled = stillStreak.current >= DWELL_STILL_TICKS;
+        const diffFromLast = lastAcceptedThumb.current ? frameMotion(lastAcceptedThumb.current, thumb) : 1;
+        const looksNew = diffFromLast >= MIN_DIFF_FROM_LAST;
+        if (!stalled && !(dwelled && looksNew)) {
+          // Dwelled the full 3s but still looks like the last accepted
+          // frame — nudge back to "move" rather than capturing a duplicate.
+          setMotionStatus(dwelled ? "move" : "hold");
           return;
         }
+        lastAcceptedThumb.current = thumb;
 
         const f = analyzePhase2Frame(raw, p1.current.denomination);
         p2.current.oviChromas.push(f.oviChroma);
@@ -1338,7 +1373,7 @@ export function CameraScreen() {
   // instructions to read, since capture is automatic and needs none.
   const MotionStatusLine = ({ status, accent }: { status: "move" | "hold" | "captured"; accent: string }) => (
     <Text style={[styles.sheetSub, { color: status === "captured" ? "#4ADE80" : accent, fontWeight: "700" }]}>
-      {status === "move" ? "Move the note there…" : status === "hold" ? "Hold it…" : "✓ Captured"}
+      {status === "move" ? "Get it in position…" : status === "hold" ? "Hold still — capturing in a moment…" : "✓ Captured"}
     </Text>
   );
 
