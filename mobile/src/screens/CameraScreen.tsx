@@ -29,6 +29,16 @@ const PASS_THRESHOLD  = 0.80;
 const MOTION_THUMB          = 16;   // thumbnail side, pixels — cheap on purpose
 const MOTION_MOVE_THRESHOLD = 0.05; // above this, frame-to-frame, counts as "moving"
 const MOTION_STILL_THRESHOLD = 0.02; // below this counts as "held still"
+// Quality of the throwaway photos taken purely to watch for motion. Phase 2
+// used to poll at its full 0.7 analysis quality on every tick just to check
+// whether the note had moved — the most expensive capture in the app, taken
+// over and over while nothing was even happening yet. Only the one frame
+// actually accepted per direction needs real detail; every poll before that
+// can be as cheap as the motion check itself requires.
+const POLL_QUALITY = 0.15;
+// Polls are now a cheap throwaway shot instead of a full-quality one, so they
+// can run closer together without adding real cost.
+const POLL_INTERVAL_MS = 200;
 const TARGET_FRAMES   = 4;     // one per tilt direction
 
 // Feature thresholds, from two scans of genuine $10 AK173948183 and one of
@@ -762,7 +772,7 @@ export function CameraScreen() {
   // current frame is anyway. Without it a stall here would hang the scan
   // completely rather than just costing one lower-quality frame.
   const motionStallRef = useRef(0);
-  const MOTION_STALL_LIMIT = 30; // ~30 * 280ms ≈ 8.4s per direction
+  const MOTION_STALL_LIMIT = 40; // ~40 * 200ms = 8s per direction
   const resetMotion = () => {
     motionPrevThumb.current = null;
     motionSawMove.current = false;
@@ -959,7 +969,7 @@ export function CameraScreen() {
         resetMotion(); // must see fresh movement before the next side counts
         setTiltHint(h => (h + 1) % TILT_HINTS.length);
       } catch {} finally { busyRef.current = false; }
-    }, 280);
+    }, POLL_INTERVAL_MS);
   };
 
   const finalizeBird = () => {
@@ -1016,15 +1026,17 @@ export function CameraScreen() {
       if (!cameraRef.current || busyRef.current) return;
       busyRef.current = true;
       try {
-        // Chroma and region variance tolerate compression; only the sharpness
-        // measure in phase 2 needs full detail.
-        const photo = await cameraRef.current.takePictureAsync({
-          base64: true, quality: 0.4, skipProcessing: true, shutterSound: false,
+        // Poll cheaply — this photo is thrown away the moment it fails the
+        // motion check, which is most polls. Taking a full 0.4-quality shot
+        // on every tick just to watch for movement was pure waste; only the
+        // one accepted frame per direction needs real detail.
+        const pollPhoto = await cameraRef.current.takePictureAsync({
+          base64: true, quality: POLL_QUALITY, skipProcessing: true, shutterSound: false,
         });
-        if (!photo?.base64) return;
-        const raw = Uint8Array.from(atob(photo.base64), c => c.charCodeAt(0));
+        if (!pollPhoto?.base64) return;
+        const pollRaw = Uint8Array.from(atob(pollPhoto.base64), c => c.charCodeAt(0));
 
-        const thumb = frameThumbnail(raw, p1.current.denomination);
+        const thumb = frameThumbnail(pollRaw, p1.current.denomination);
         const motion  = frameMotion(motionPrevThumb.current, thumb);
         const stalled = motionStallRef.current >= MOTION_STALL_LIMIT;
         motionPrevThumb.current = thumb;
@@ -1040,6 +1052,15 @@ export function CameraScreen() {
           return;
         }
 
+        // Held still — now take the one photo this frame actually needs.
+        // Chroma and region variance tolerate compression; only the sharpness
+        // measure in phase 2 needs full detail.
+        const photo = await cameraRef.current.takePictureAsync({
+          base64: true, quality: 0.4, skipProcessing: true, shutterSound: false,
+        });
+        if (!photo?.base64) return;
+        const raw = Uint8Array.from(atob(photo.base64), c => c.charCodeAt(0));
+
         runMlDenomination(raw);
         const f = analyzePhase1Frame(raw, p1.current.denomination);
         p1.current.oviChromas.push(f.oviChroma);
@@ -1053,7 +1074,7 @@ export function CameraScreen() {
         resetMotion();
         setTiltHint(h => (h + 1) % TILT_HINTS.length);
       } catch {} finally { busyRef.current = false; }
-    }, 280);
+    }, POLL_INTERVAL_MS);
   };
 
   const finalizePhase1 = () => {
@@ -1111,13 +1132,17 @@ export function CameraScreen() {
       if (!cameraRef.current || busyRef.current) return;
       busyRef.current = true;
       try {
-        const photo = await cameraRef.current.takePictureAsync({
-          base64: true, quality: 0.7, skipProcessing: true, shutterSound: false,
+        // This is the phase most worth optimising: 0.7 quality was being
+        // taken on every poll just to watch for movement, and this was the
+        // most expensive capture in the app. Poll cheap instead; only the
+        // one accepted frame per direction needs full detail.
+        const pollPhoto = await cameraRef.current.takePictureAsync({
+          base64: true, quality: POLL_QUALITY, skipProcessing: true, shutterSound: false,
         });
-        if (!photo?.base64) return;
-        const raw = Uint8Array.from(atob(photo.base64), c => c.charCodeAt(0));
+        if (!pollPhoto?.base64) return;
+        const pollRaw = Uint8Array.from(atob(pollPhoto.base64), c => c.charCodeAt(0));
 
-        const thumb = frameThumbnail(raw, p1.current.denomination);
+        const thumb = frameThumbnail(pollRaw, p1.current.denomination);
         const motion  = frameMotion(motionPrevThumb.current, thumb);
         const stalled = motionStallRef.current >= MOTION_STALL_LIMIT;
         motionPrevThumb.current = thumb;
@@ -1132,6 +1157,12 @@ export function CameraScreen() {
           setMotionStatus(motionSawMove.current ? "hold" : "move");
           return;
         }
+
+        const photo = await cameraRef.current.takePictureAsync({
+          base64: true, quality: 0.7, skipProcessing: true, shutterSound: false,
+        });
+        if (!photo?.base64) return;
+        const raw = Uint8Array.from(atob(photo.base64), c => c.charCodeAt(0));
 
         const f = analyzePhase2Frame(raw, p1.current.denomination);
         p2.current.oviChromas.push(f.oviChroma);
@@ -1151,7 +1182,7 @@ export function CameraScreen() {
         resetMotion();
         setTiltHint(h => (h + 1) % TILT_HINTS.length);
       } catch {} finally { busyRef.current = false; }
-    }, 280);
+    }, POLL_INTERVAL_MS);
   };
 
   const finalizePhase2 = async () => {
