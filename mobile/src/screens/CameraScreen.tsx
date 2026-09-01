@@ -1449,13 +1449,10 @@ export function CameraScreen() {
         <TopBar step={1} onClose={() => { stopInterval(); setTorchOn(false); navigation.goBack(); }} />
 
         <NoteFrame>
-          {/* Static, not animated — nothing to "follow". Shows the one
-              position to hold the note at; the app watches the camera and
-              captures on its own the moment it sees you get there and stop. */}
-          <View style={[styles.birdBadge, {
-            borderColor: accent, backgroundColor: `${accent}22`,
-            transform: [{ rotate: `${tiltHint === 0 ? -TILT_TARGET_DEG : TILT_TARGET_DEG}deg` }],
-          }]}>
+          {/* Not rotated. It was meant to demonstrate the tilt angle, but a
+              tilted icon next to a direction arrow was one confusing thing
+              too many — the arrow and label below already say what to do. */}
+          <View style={[styles.birdBadge, { borderColor: accent, backgroundColor: `${accent}22` }]}>
             <Text style={styles.birdIcon}>🦅</Text>
           </View>
         </NoteFrame>
