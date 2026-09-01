@@ -240,7 +240,7 @@ function cropToNote(img: tf.Tensor3D, denom: number | null, zone?: Rect): tf.Ten
   return zone ? cropRect(note, zone) : note;
 }
 
-type ScanPhase = "loading" | "serial" | "bird" | "phase1" | "flip" | "phase2" | "done";
+type ScanPhase = "setup" | "loading" | "serial" | "bird" | "phase1" | "flip" | "phase2" | "done";
 type CheckStatus = "pending" | "pass" | "fail";
 interface CheckItem { label: string; status: CheckStatus }
 
@@ -645,7 +645,7 @@ export function CameraScreen() {
   const hc = isHighContrastEnabled;
   const accent = hc ? "#CCFF00" : Theme.colors.gold;
 
-  const [phase,     setPhase]     = useState<ScanPhase>("loading");
+  const [phase,     setPhase]     = useState<ScanPhase>("setup");
   const [progress,  setProgress]  = useState(0);
   const [serial,    setSerial]    = useState<string>("");
   const [denom,     setDenom]     = useState<number | null>(null);
@@ -739,6 +739,15 @@ export function CameraScreen() {
     ).start();
   };
 
+  // The scan does not start the moment the screen opens. Repeat scans of the
+  // same genuine note produced swing values from 0.024 to 0.057 on one check
+  // alone — a spread as wide as the real/fake gap it is meant to detect — and
+  // the working theory is that grip, distance and tilt speed vary between
+  // scans more than the note does. A short guided setup, held the same way
+  // every time, is the only lever that can fix that; the pixel measurements
+  // cannot correct for it after the fact.
+  const setupDoneRef = useRef(false);
+
   useEffect(() => {
     (async () => {
       try {
@@ -750,7 +759,7 @@ export function CameraScreen() {
         modelRef.current.predict(dummy);
         dummy.dispose();
         modelReadyRef.current = true;
-        if (cameraReadyRef.current) startSerialPhase();
+        if (cameraReadyRef.current && setupDoneRef.current) startSerialPhase();
       } catch (e: any) { console.error("[ML] Load failed:", e?.message); }
     })();
     return () => stopInterval();
@@ -758,7 +767,13 @@ export function CameraScreen() {
 
   const onCameraReady = () => {
     cameraReadyRef.current = true;
-    if (modelReadyRef.current) startSerialPhase();
+    if (modelReadyRef.current && setupDoneRef.current) startSerialPhase();
+  };
+
+  const beginScan = () => {
+    setupDoneRef.current = true;
+    setPhase("loading");
+    if (cameraReadyRef.current && modelReadyRef.current) startSerialPhase();
   };
 
   // ─── STEP 1: Serial ──────────────────────────────────────────────────────
@@ -1379,6 +1394,59 @@ export function CameraScreen() {
     );
   }
 
+  // ─── SETUP: how to hold the note, shown once before every scan ─────────────
+  // Three rules, chosen because they are the three things that varied most
+  // between repeat scans of the same note in testing: how far the note sits
+  // from the camera, how flat it's held, and how fast it's tilted. Nothing
+  // downstream can correct for these after the photo is taken.
+  if (phase === "setup") {
+    return (
+      <View style={styles.root}>
+        <View style={styles.sheetOverlay}>
+          <Text style={styles.bigTitle}>HOW TO SCAN</Text>
+          <Text style={styles.bigSub}>Three things keep every scan consistent</Text>
+
+          <View style={styles.setupList}>
+            <View style={styles.setupRow}>
+              <View style={[styles.setupIcon, { borderColor: accent }]}>
+                <Text style={[styles.setupIconText, { color: accent }]}>1</Text>
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.setupHead}>Same distance every time</Text>
+                <Text style={styles.setupBody}>Fill the frame guide with the note — not closer, not further. About one hand's length away.</Text>
+              </View>
+            </View>
+            <View style={styles.setupRow}>
+              <View style={[styles.setupIcon, { borderColor: accent }]}>
+                <Text style={[styles.setupIconText, { color: accent }]}>2</Text>
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.setupHead}>Rest your elbow on something</Text>
+                <Text style={styles.setupBody}>A table or your other hand. A steadier grip means a cleaner reading.</Text>
+              </View>
+            </View>
+            <View style={styles.setupRow}>
+              <View style={[styles.setupIcon, { borderColor: accent }]}>
+                <Text style={[styles.setupIconText, { color: accent }]}>3</Text>
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.setupHead}>Tilt slowly, not fast</Text>
+                <Text style={styles.setupBody}>When asked to tilt left or right, move the note over about a second — a quick flick is too fast to capture cleanly.</Text>
+              </View>
+            </View>
+          </View>
+
+          <TouchableOpacity style={[styles.btn, styles.btnWide, { backgroundColor: accent }]} onPress={beginScan}>
+            <Text style={styles.btnText}>START SCANNING</Text>
+          </TouchableOpacity>
+          <TouchableOpacity onPress={() => navigation.goBack()} style={{ marginTop: 14 }}>
+            <Text style={styles.linkText}>Cancel</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    );
+  }
+
   // ─── STEP 1: SERIAL ──────────────────────────────────────────────────────
   if (phase === "serial" || phase === "loading") {
     const found = ocrStatus === "found";
@@ -1636,4 +1704,15 @@ const styles = StyleSheet.create({
   // ── Permission ──
   permTitle: { color: "#fff", fontSize: 21, fontWeight: "800", textAlign: "center", marginBottom: 10 },
   permSub:   { color: "rgba(255,255,255,0.5)", fontSize: 14, textAlign: "center", lineHeight: 21, marginBottom: 28 },
+
+  // ── Setup screen ──
+  setupList: { width: "100%", gap: 22, marginTop: 30, marginBottom: 34 },
+  setupRow:  { flexDirection: "row", alignItems: "flex-start", gap: 14 },
+  setupIcon: {
+    width: 30, height: 30, borderRadius: 15, borderWidth: 1.5,
+    alignItems: "center", justifyContent: "center", marginTop: 2,
+  },
+  setupIconText: { fontSize: 13, fontWeight: "900" },
+  setupHead: { color: "#fff", fontSize: 15, fontWeight: "700", marginBottom: 3 },
+  setupBody: { color: "rgba(255,255,255,0.55)", fontSize: 13, lineHeight: 19 },
 });
