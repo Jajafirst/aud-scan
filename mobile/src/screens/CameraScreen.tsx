@@ -544,14 +544,22 @@ function alignedDifference(a: number[], b: number[]): number {
 // reflection or a wobble can inflate how MUCH a patch changes, but it cannot
 // manufacture a second stable appearance that recurs across frames.
 //
-// Greedy clustering: each frame joins the first state it closely matches,
-// otherwise it opens a new one. Patches are aligned before comparison, so a
-// handheld note drifting in frame does not split one state into several.
+// Complete-linkage clustering: a frame joins a state only if it matches
+// EVERY member already in it, not just the first one. A single-link version
+// (join on matching any one member) has a real bug: three frames at
+// distances [0.55, 0.50, 0.64] against a 0.60 threshold means frame 2 and
+// frame 3 actually differ from each other, but both happened to be close to
+// frame 1, so single-link folds all three into one state — hiding a real
+// second appearance the numeral check exists to detect. Complete-linkage
+// catches this: frame 3 fails to match frame 2 (already in frame 1's state),
+// so it correctly opens a second state instead.
 function countDistinctStates(patches: number[][], sameThreshold: number): number {
-  const states: number[][] = [];
+  const states: number[][][] = [];
   for (const p of patches) {
     if (p.length !== PATCH_N * PATCH_N) continue;
-    if (!states.some(s => alignedDifference(s, p) < sameThreshold)) states.push(p);
+    const state = states.find(st => st.every(s => alignedDifference(s, p) < sameThreshold));
+    if (state) state.push(p);
+    else states.push([p]);
   }
   return states.length;
 }
