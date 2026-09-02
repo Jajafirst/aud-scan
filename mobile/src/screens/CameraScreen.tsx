@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from "react";
-import { View, Text, StyleSheet, ActivityIndicator, Animated, Easing, Dimensions } from "react-native";
+import { View, Text, StyleSheet, ActivityIndicator, Animated, Dimensions } from "react-native";
 import { CameraView, useCameraPermissions } from "expo-camera";
+import { Accelerometer } from "expo-sensors";
 import { TouchableOpacity } from "react-native";
 import { useNavigation } from "@react-navigation/native";
 import { X } from "lucide-react-native";
@@ -16,10 +17,11 @@ const MODEL_URL       = "https://teachablemachine.withgoogle.com/models/Z11VY126
 const DENOM_THRESHOLD = 0.35;
 const PASS_THRESHOLD  = 0.80;
 // Capture timing went through several designs before this one: a fixed
-// timer that guessed when the user was done moving, a manual button, then
-// motion detection with a stillness dwell. All were replaced (see
-// SWEEP_HALF_MS near sleep()) by a guide the app itself paces, which sets
-// exactly when each photo is taken instead of trying to infer it.
+// timer, a manual button, motion detection inferred from camera frames, a
+// scheduled sweep animation. All were replaced by a real accelerometer
+// reading (see TILT_CAPTURE_THRESHOLD near sleep()) — the note now rests on
+// a surface and the phone tilts, so capture triggers on an actual measured
+// angle instead of trying to infer or schedule one.
 //
 // One capture per tilt direction — left, right, done. At 3 (with only 2
 // directions) the third capture always repeated "TILT LEFT" again, an extra
@@ -278,26 +280,27 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
-// Every earlier version of this tried to detect the right moment to capture
-// after the fact — a fixed timer, a rocking animation the capture logic
-// didn't actually watch, motion detection with a stillness dwell. All of
-// them either fired too early, too late, or made the user wait through a
-// state machine. This inverts it: the app SETS the pace with a guide line
-// that sweeps left then right, and captures at the exact instant the line
-// reaches each side. The user's only job is to have the note there when it
-// arrives — following a moving target, not guessing when a hidden detector
-// will decide it's satisfied.
-// A genuine note's colour swing measured 0.0035 on a scan right after this
-// went live, against ~0.05+ historically on the same physical note — a real
-// regression, not noise. The likely cause: capture is scheduled by TIME, not
-// verified against whether the user actually reached the tilt — at 900ms a
-// hand may still be mid-motion when the shutter fires, so both captured
-// angles land closer together than intended, shrinking every swing
-// measurement regardless of whether the note is genuine. Raised to 1300ms to
-// give a real tilt more time to land before the photo is taken. This is a
-// timing fix, not a threshold fix — loosening TH_OVI_SWING_FRONT instead
-// would have let counterfeits back in along with rescuing genuine notes.
-const SWEEP_HALF_MS = 1300; // time for the guide to travel from centre to one side
+// The interaction inverted: the note now rests flat on a surface and the
+// PHONE tilts, not the note. Every earlier design (fixed timer, an animation
+// disconnected from capture, motion detection inferred from camera frames,
+// a fixed-schedule sweep) was trying to guess or infer whether real tilting
+// had happened. None of them could know for certain, because none of them
+// had access to a real measurement of anything physically moving.
+//
+// A phone's accelerometer can. With the phone held roughly flat, camera
+// facing down at the note, gravity's component on the device's X axis grows
+// as the phone rolls left or right — reading close to 0 when flat, rising in
+// magnitude as the tilt increases. That's a real, direct measurement of the
+// same motion the on-screen scale represents, not an inference from pixels.
+//
+// TILT_CAPTURE_THRESHOLD is in accelerometer g-units — UNVERIFIED on a real
+// device: the axis (x vs y) and its sign depend on how the phone is actually
+// held, which can only be confirmed by watching the live reading while
+// tilting a real phone. If the scale moves the wrong way, or capture never
+// triggers, that's the first thing to check — see the [Tilt] log line.
+const TILT_CAPTURE_THRESHOLD = 0.35; // g — how far you must roll before a side counts as "reached"
+const TILT_POLL_MS = 40;             // how often the wait loop checks the live reading
+const TILT_WAIT_TIMEOUT_MS = 8000;   // safety net — proceed anyway rather than hang forever
 
 function getDominantHue(r: tf.Tensor, g: tf.Tensor, b: tf.Tensor): number {
   const rM = r.mean().dataSync()[0] / 255;
@@ -590,12 +593,13 @@ function patchDistances(patches: number[][]): number[] {
 }
 
 // Whether the two captured sides of a phase actually look like different
-// angles at all, independent of any specific security feature. Capture is
-// scheduled by TIME now (see SWEEP_HALF_MS), not verified against whether
-// the user's hand really reached the tilt — so a note held mostly still
-// through the sweep produces two near-identical photos, and every swing
-// measurement (front/back colour, bird) reads as small on that pair
-// regardless of whether the note is genuine. This gives every check an
+// angles at all, independent of any specific security feature. Capture now
+// waits for a real accelerometer reading (TILT_CAPTURE_THRESHOLD) before
+// firing, which should make this redundant in the normal case — but it's
+// kept as a second, independent check: if the axis assumption is wrong for
+// how a phone is actually held, or a reading is noisy, this still catches
+// two photos that don't actually look like different angles, rather than
+// trusting the sensor blindly. This gives every check an
 // honest way to say "we can't tell, you didn't really tilt" instead of
 // silently reporting SUSPICIOUS for a reason that has nothing to do with
 // the note. MIN_TILT_MOVED is PROVISIONAL — the frameMoved= log line is
@@ -794,14 +798,55 @@ export function CameraScreen() {
   const birdRatio      = useRef<number[]>([]);
   const birdVariance   = useRef<number[]>([]);
   const birdPatches    = useRef<number[][]>([]);
-  // Drives the guide dot sweeping left then right, and is the SAME value the
-  // capture timing is scheduled against (see SWEEP_HALF_MS) — not a decor
-  // animation running independently of what the camera is doing.
+  // Drives the on-screen scale, updated live from the accelerometer on every
+  // reading (see the Accelerometer subscription below) — a real sensor value,
+  // not a scheduled animation. Reused as-is from the earlier sweep design
+  // since GuideTrack already reads it the same way either way.
   const tiltAnim = useRef(new Animated.Value(0)).current;
-  // "move" = the guide is sweeping, nothing captured yet this leg. "captured"
-  // = the flash shown right when a photo is taken, at the guide's endpoint.
+  // The live reading itself, for the capture-wait loop to poll. A ref, not
+  // state — this updates far too often (every accelerometer sample) to run
+  // through React's render cycle.
+  const liveTiltRef = useRef(0);
+  // "move" = waiting for the phone to reach the requested side. "captured"
+  // = the flash shown right when a photo is taken, at that instant.
   const [motionStatus, setMotionStatus] = useState<"move" | "captured">("move");
 
+  // Live accelerometer subscription for the whole scan session — cheaper to
+  // keep running than to subscribe/unsubscribe every phase, and short-lived
+  // either way since a scan only takes a few seconds.
+  useEffect(() => {
+    Accelerometer.setUpdateInterval(TILT_POLL_MS);
+    const sub = Accelerometer.addListener(({ x }) => {
+      liveTiltRef.current = x;
+      tiltAnim.setValue(Math.max(-1, Math.min(1, x / TILT_CAPTURE_THRESHOLD)));
+    });
+    return () => sub.remove();
+  }, []);
+
+  // Waits for the live tilt reading to cross the threshold in the given
+  // direction, polling every TILT_POLL_MS. Gives up after
+  // TILT_WAIT_TIMEOUT_MS and returns anyway — a stalled sensor or an
+  // unusually gentle tilt should not be able to hang the scan forever, same
+  // reasoning as every earlier stall fallback in this file.
+  const waitForTilt = async (dir: 1 | -1) => {
+    const start = Date.now();
+    while (Date.now() - start < TILT_WAIT_TIMEOUT_MS) {
+      if (dir * liveTiltRef.current >= TILT_CAPTURE_THRESHOLD) return;
+      await sleep(TILT_POLL_MS);
+    }
+  };
+
+  // Waits for the phone to pass back through roughly flat, between the left
+  // and right captures — used only for the reversing-numeral's extra middle
+  // shot (see startPhase2), which needs a genuinely different angle from
+  // either side capture, not just "close to the last one."
+  const waitForCenter = async () => {
+    const start = Date.now();
+    while (Date.now() - start < TILT_WAIT_TIMEOUT_MS / 2) {
+      if (Math.abs(liveTiltRef.current) < TILT_CAPTURE_THRESHOLD * 0.35) return;
+      await sleep(TILT_POLL_MS);
+    }
+  };
 
   useEffect(() => { phaseRef.current = phase; }, [phase]);
 
@@ -920,13 +965,10 @@ export function CameraScreen() {
     startBirdPhase();
   };
 
-  // ─── STEP 2: Flying Bird (torch on, tilt all directions) ─────────────────
-  // Capture is user-triggered: tilt to the shown direction, tap the button
-  // when you're there. No timer decides this for you.
-  // No waiting for the user to be detected as "ready" — the guide dot sets
-  // the pace, and a photo is taken at the instant it reaches each side. See
-  // the SWEEP_HALF_MS comment above sleep() for why this replaced motion
-  // detection entirely, not just its thresholds.
+  // ─── STEP 2: Flying Bird (torch on, tilt the PHONE) ───────────────────────
+  // The note stays flat on a surface; the phone tilts. Capture waits for a
+  // real accelerometer reading to cross TILT_CAPTURE_THRESHOLD — a genuine
+  // measurement of the phone's own motion, not an inference from the camera.
   const startBirdPhase = async () => {
     setPhase("bird");
     setProgress(0);
@@ -939,7 +981,6 @@ export function CameraScreen() {
     birdVariance.current   = [];
     birdPatches.current    = [];
     setTorchOn(true);
-    tiltAnim.setValue(0);
 
     const captureBirdSide = async (side: 0 | 1) => {
       if (!cameraRef.current) return;
@@ -960,15 +1001,13 @@ export function CameraScreen() {
       setMotionStatus("captured");
     };
 
-    Animated.timing(tiltAnim, { toValue: -1, duration: SWEEP_HALF_MS, useNativeDriver: true }).start();
-    await sleep(SWEEP_HALF_MS);
-    if (phaseRef.current !== "bird") return; // user backed out mid-sweep
+    await waitForTilt(-1);
+    if (phaseRef.current !== "bird") return; // user backed out mid-tilt
     await captureBirdSide(0);
     setTiltHint(1);
     setMotionStatus("move");
 
-    Animated.timing(tiltAnim, { toValue: 1, duration: SWEEP_HALF_MS * 2, useNativeDriver: true }).start();
-    await sleep(SWEEP_HALF_MS * 2);
+    await waitForTilt(1);
     if (phaseRef.current !== "bird") return;
     await captureBirdSide(1);
 
@@ -1016,7 +1055,6 @@ export function CameraScreen() {
     setProgress(0);
     setTiltHint(0);
     setMotionStatus("move");
-    tiltAnim.setValue(0);
 
     const captureSide = async (side: 0 | 1) => {
       if (!cameraRef.current) return;
@@ -1038,15 +1076,13 @@ export function CameraScreen() {
       setMotionStatus("captured");
     };
 
-    Animated.timing(tiltAnim, { toValue: -1, duration: SWEEP_HALF_MS, useNativeDriver: true }).start();
-    await sleep(SWEEP_HALF_MS);
+    await waitForTilt(-1);
     if (phaseRef.current !== "phase1") return;
     await captureSide(0);
     setTiltHint(1);
     setMotionStatus("move");
 
-    Animated.timing(tiltAnim, { toValue: 1, duration: SWEEP_HALF_MS * 2, useNativeDriver: true }).start();
-    await sleep(SWEEP_HALF_MS * 2);
+    await waitForTilt(1);
     if (phaseRef.current !== "phase1") return;
     await captureSide(1);
 
@@ -1105,7 +1141,6 @@ export function CameraScreen() {
     setProgress(0);
     setTiltHint(0);
     setMotionStatus("move");
-    tiltAnim.setValue(0);
 
     const captureSide = async (side: 0 | 1) => {
       if (!cameraRef.current) return;
@@ -1132,22 +1167,21 @@ export function CameraScreen() {
       setMotionStatus("captured");
     };
 
-    Animated.timing(tiltAnim, { toValue: -1, duration: SWEEP_HALF_MS, useNativeDriver: true }).start();
-    await sleep(SWEEP_HALF_MS);
+    await waitForTilt(-1);
     if (phaseRef.current !== "phase2") return;
     await captureSide(0);
     setTiltHint(1);
     setMotionStatus("move");
 
-    Animated.timing(tiltAnim, { toValue: 1, duration: SWEEP_HALF_MS * 2, useNativeDriver: true }).start();
     // The numeral needs a THIRD sample the other checks don't: the physical
     // feature has three appearances (no number, mirrored, normal) as light
     // rakes across it, not two, so two captures can at most confirm "this
     // changed," never "we actually saw the whole progression." This extra
-    // shot lands roughly where the sweep crosses centre — a different angle
+    // shot is taken once the phone passes back through roughly flat, on its
+    // way from the left tilt to the right one — a genuinely different angle
     // from either side capture — and feeds ONLY numeralPatches; the other
     // arrays (chroma, sharpness, detail) stay at their normal 2 samples.
-    await sleep(SWEEP_HALF_MS);
+    await waitForCenter();
     if (phaseRef.current === "phase2" && cameraRef.current) {
       try {
         const midPhoto = await cameraRef.current.takePictureAsync({
@@ -1163,7 +1197,8 @@ export function CameraScreen() {
         }
       } catch {}
     }
-    await sleep(SWEEP_HALF_MS);
+
+    await waitForTilt(1);
     if (phaseRef.current !== "phase2") return;
     await captureSide(1);
 
@@ -1335,7 +1370,7 @@ export function CameraScreen() {
   // The literal thing asked for: a horizontal line with a dot that sweeps
   // left then right, driven by tiltAnim — the SAME value the capture timing
   // is scheduled against, so this isn't decoration running independently of
-  // what the camera does. Tilt the note to keep the dot roughly centred.
+  // what the camera does. Tilt the PHONE to keep the dot roughly centred — the note stays put.
   const GuideTrack = () => (
     <View style={styles.guideTrack}>
       <View style={styles.guideLine} />
@@ -1523,7 +1558,7 @@ export function CameraScreen() {
 
           <ProgressBar />
           <GuideTrack />
-          <Text style={styles.tip}>Line up the note's bird in the circle, then tilt to follow the dot</Text>
+          <Text style={styles.tip}>Line up the note's bird in the circle, then tilt the phone to follow the scale</Text>
           <Text style={styles.tip}>{Math.round(progress * TARGET_FRAMES)}/{TARGET_FRAMES} captured</Text>
         </View>
       </View>
@@ -1547,8 +1582,8 @@ export function CameraScreen() {
                 <Text style={[styles.setupIconText, { color: accent }]}>1</Text>
               </View>
               <View style={{ flex: 1 }}>
-                <Text style={styles.setupHead}>Same distance every time</Text>
-                <Text style={styles.setupBody}>Fill the frame guide with the note — not closer, not further. About one hand's length away.</Text>
+                <Text style={styles.setupHead}>Put the note down flat</Text>
+                <Text style={styles.setupBody}>On a table, under good light. It stays still for the whole scan — you don't touch it again once it's positioned.</Text>
               </View>
             </View>
             <View style={styles.setupRow}>
@@ -1556,8 +1591,8 @@ export function CameraScreen() {
                 <Text style={[styles.setupIconText, { color: accent }]}>2</Text>
               </View>
               <View style={{ flex: 1 }}>
-                <Text style={styles.setupHead}>Rest your elbow on something</Text>
-                <Text style={styles.setupBody}>A table or your other hand. A steadier grip means a cleaner reading.</Text>
+                <Text style={styles.setupHead}>Hold the phone above it</Text>
+                <Text style={styles.setupBody}>Fill the frame guide with the note — not closer, not further. About one hand's length above it.</Text>
               </View>
             </View>
             <View style={styles.setupRow}>
@@ -1565,8 +1600,8 @@ export function CameraScreen() {
                 <Text style={[styles.setupIconText, { color: accent }]}>3</Text>
               </View>
               <View style={{ flex: 1 }}>
-                <Text style={styles.setupHead}>Tilt a real amount, not a wobble</Text>
-                <Text style={styles.setupBody}>The app captures on its own — no tapping. Just tilt the note the way the arrow shows and hold it a moment; a small wobble won't catch the colour-shift effect at all.</Text>
+                <Text style={styles.setupHead}>Tilt the phone, not the note</Text>
+                <Text style={styles.setupBody}>The scale on screen tracks your phone's real tilt. Roll it left, then right, keeping the note in the frame guide — capture happens on its own once you reach each side.</Text>
               </View>
             </View>
           </View>
