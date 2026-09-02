@@ -361,10 +361,18 @@ function zoneChroma(img: tf.Tensor3D, denom: number | null, zone: Rect): number 
 // comparison is of PATTERN, not brightness: the same picture at two exposures
 // must not count as two different appearances.
 function normalizedPatch(img: tf.Tensor3D, denom: number | null, zone: Rect): number[] {
-  const patch = tf.image.resizeBilinear(cropToNote(img, denom, zone), [PATCH_N, PATCH_N]).toFloat();
-  const pg = patch.slice([0, 0, 0], [-1, -1, 1]).mul(0.299)
-    .add(patch.slice([0, 0, 1], [-1, -1, 1]).mul(0.587))
-    .add(patch.slice([0, 0, 2], [-1, -1, 1]).mul(0.114)).div(255);
+  return patchFromTensor(cropToNote(img, denom, zone));
+}
+
+// Same normalisation as normalizedPatch, but works on a tensor already cropped
+// — lets analyzePhase1Frame/analyzePhase2Frame reuse the whole-note tensor
+// they compute anyway (for colour tone / substrate texture) instead of
+// decoding and cropping the image a second time just for this.
+function patchFromTensor(t: tf.Tensor3D): number[] {
+  const small = tf.image.resizeBilinear(t, [PATCH_N, PATCH_N]).toFloat();
+  const pg = small.slice([0, 0, 0], [-1, -1, 1]).mul(0.299)
+    .add(small.slice([0, 0, 1], [-1, -1, 1]).mul(0.587))
+    .add(small.slice([0, 0, 2], [-1, -1, 1]).mul(0.114)).div(255);
   const m = pg.mean();
   const sd = pg.sub(m).square().mean().sqrt();
   return Array.from(pg.sub(m).div(sd.add(1e-4)).dataSync());
@@ -446,8 +454,12 @@ function analyzePhase1Frame(raw: Uint8Array, denomination: number | null) {
     const oviChroma = zoneChroma(img, denomination, z.rolling);
     const oviHue    = zoneHue(img, denomination, z.rolling);
 
+    // Whole-note pattern, independent of any specific security feature — see
+    // checkTiltMoved. Reuses noteImg, already computed above; no extra decode.
+    const framePatch = patchFromTensor(noteImg);
+
     console.log(`[P1] noteHue=${noteHue.toFixed(1)}° sat=${saturation.toFixed(2)} oviChroma=${oviChroma.toFixed(4)} winVar=${winVar.toFixed(4)} win/body=${winLuma.toFixed(3)}/${bodyLuma.toFixed(3)} ratio=${(bodyLuma > 0 ? winLuma / bodyLuma : 0).toFixed(3)}`);
-    return { colorTone, oviChroma, winVar, winLuma, bodyLuma };
+    return { colorTone, oviChroma, winVar, winLuma, bodyLuma, framePatch };
   });
 }
 
@@ -487,8 +499,11 @@ function analyzePhase2Frame(raw: Uint8Array, denom: number | null) {
     // a change of shape.
     const numeralPatch = normalizedPatch(img, denom, z.numeral);
 
+    // See checkTiltMoved — reuses noteImg, already computed above.
+    const framePatch = patchFromTensor(noteImg);
+
     console.log(`[P2] sharp=${sharpness.toFixed(5)} detail=${noiseMean.toFixed(5)} oviChroma=${oviChroma.toFixed(4)} oviHue=${oviHue.toFixed(1)}°`);
-    return { sharpness, detail: noiseMean, oviChroma, numeralPatch };
+    return { sharpness, detail: noiseMean, oviChroma, numeralPatch, framePatch };
   });
 }
 
@@ -572,6 +587,24 @@ function patchDistances(patches: number[][]): number[] {
     for (let j = i + 1; j < patches.length; j++)
       out.push(alignedDifference(patches[i], patches[j]));
   return out;
+}
+
+// Whether the two captured sides of a phase actually look like different
+// angles at all, independent of any specific security feature. Capture is
+// scheduled by TIME now (see SWEEP_HALF_MS), not verified against whether
+// the user's hand really reached the tilt — so a note held mostly still
+// through the sweep produces two near-identical photos, and every swing
+// measurement (front/back colour, bird) reads as small on that pair
+// regardless of whether the note is genuine. This gives every check an
+// honest way to say "we can't tell, you didn't really tilt" instead of
+// silently reporting SUSPICIOUS for a reason that has nothing to do with
+// the note. MIN_TILT_MOVED is PROVISIONAL — the frameMoved= log line is
+// there to calibrate it against real held-still vs real-tilt distances.
+const MIN_TILT_MOVED = 0.20;
+function checkTiltMoved(framePatches: number[][]): { moved: boolean; dist: number } {
+  if (framePatches.length < 2) return { moved: true, dist: 1 }; // nothing to compare — don't block on it
+  const dist = alignedDifference(framePatches[0], framePatches[1]);
+  return { moved: dist >= MIN_TILT_MOVED, dist };
 }
 
 function maxPatchDifference(patches: number[][]): number {
@@ -731,12 +764,17 @@ export function CameraScreen() {
     winVars: [] as number[],
     winRatios: [] as number[],
     colorToneFlags: [] as boolean[],
+    // Whole-note patch per captured side, independent of any specific
+    // security feature. Used only to check whether the two captures actually
+    // look like different angles at all — see checkTiltMoved.
+    framePatches: [] as number[][],
   });
   const p2 = useRef({
     oviChromas: [] as number[],
     sharpnesses: [] as number[],
     details: [] as number[],
     numeralPatches: [] as number[][],
+    framePatches: [] as number[][],
     // The frame whose OVI band was most vivid — the numeral is most likely to
     // be fully formed there, so the mirrored-numeral read is done on it.
     bestUri: "" as string,
@@ -994,6 +1032,7 @@ export function CameraScreen() {
         p1.current.winVars.push(f.winVar);
         p1.current.winRatios.push(f.bodyLuma > 0 ? f.winLuma / f.bodyLuma : 0);
         p1.current.colorToneFlags.push(f.colorTone);
+        p1.current.framePatches.push(f.framePatch);
       } catch {}
       setProgress((side + 1) / TARGET_FRAMES);
       setMotionStatus("captured");
@@ -1016,11 +1055,17 @@ export function CameraScreen() {
   };
 
   const finalizePhase1 = () => {
-    const { oviChromas, winVars, winRatios, colorToneFlags } = p1.current;
+    const { oviChromas, winVars, winRatios, colorToneFlags, framePatches } = p1.current;
+
+    // Did the two captures actually look like different angles at all? If
+    // not, every swing check below is measuring noise, not the note — see
+    // checkTiltMoved. Gates colorTone and rollingColour so an under-tilted
+    // GENUINE note gets the benefit of the doubt instead of a false fail.
+    const tilt = checkTiltMoved(framePatches);
 
     // Colour tone fails only if most frames agreed it was wrong
     const badTone   = colorToneFlags.filter(Boolean).length;
-    const colorTone = colorToneFlags.length > 0 && badTone > colorToneFlags.length / 2;
+    const colorTone = tilt.moved && colorToneFlags.length > 0 && badTone > colorToneFlags.length / 2;
 
     // Clear window — does the window brighten and darken independently of the
     // note body? A transparent panel shows the shifting background as the note
@@ -1042,13 +1087,13 @@ export function CameraScreen() {
     // swing, not the peak. Requiring a low peak as well was what let the fake
     // through: its dome is a saturated print, so peak 0.1351 cleared the bar
     // while its swing was 0.0060 against the genuine note's 0.0566.
-    const rollingColour = oviChromas.length >= 2 && chromaSwing < TH_OVI_SWING_FRONT;
+    const rollingColour = tilt.moved && oviChromas.length >= 2 && chromaSwing < TH_OVI_SWING_FRONT;
 
     p1.current.colorTone     = colorTone;
     p1.current.clearWindow   = clearWindow;
     p1.current.rollingColour = rollingColour;
 
-    console.log(`[P1 Final] frames=${oviChromas.length} chromaPeak=${chromaPeak.toFixed(4)} chromaSwing=${chromaSwing.toFixed(4)} winVar=${winVar.toFixed(4)} ratioSwing=${ratioSwing.toFixed(4)} → tone=${colorTone} window=${clearWindow} rolling=${rollingColour}`);
+    console.log(`[P1 Final] frames=${oviChromas.length} tiltMoved=${tilt.moved}(${tilt.dist.toFixed(3)}) chromaPeak=${chromaPeak.toFixed(4)} chromaSwing=${chromaSwing.toFixed(4)} winVar=${winVar.toFixed(4)} ratioSwing=${ratioSwing.toFixed(4)} → tone=${colorTone} window=${clearWindow} rolling=${rollingColour}`);
     updateCheck("Color Tone",     colorTone     ? "fail" : "pass");
     updateCheck("Clear Window",   clearWindow   ? "fail" : "pass");
     updateCheck("Rolling Colour", rollingColour ? "fail" : "pass");
@@ -1075,6 +1120,7 @@ export function CameraScreen() {
         p2.current.sharpnesses.push(f.sharpness);
         p2.current.details.push(f.detail);
         p2.current.numeralPatches.push(f.numeralPatch);
+        p2.current.framePatches.push(f.framePatch);
         if (photo.uri && f.oviChroma > p2.current.bestChroma) {
           p2.current.bestChroma = f.oviChroma;
           p2.current.bestUri    = photo.uri;
@@ -1155,12 +1201,16 @@ export function CameraScreen() {
       );
     }
 
+    // Same "did the two captures actually differ" gate as the front side —
+    // see checkTiltMoved and the P1 Final comment.
+    const tilt = checkTiltMoved(p2.current.framePatches);
+
     // Dynamic movement — same peak-and-swing test as rolling colour
     const chromaPeak      = oviChromas.length ? Math.max(...oviChromas) : 0;
     const chromaSwing     = range(oviChromas);
     // Same reasoning as rolling colour: a feature that does not change with
     // angle is not an optically variable feature, whatever colour it is.
-    const dynamicMovement = oviChromas.length >= 2 && chromaSwing < TH_OVI_SWING_BACK;
+    const dynamicMovement = tilt.moved && oviChromas.length >= 2 && chromaSwing < TH_OVI_SWING_BACK;
 
     // Median so a single motion-blurred frame can't flip either check.
     // Both of these measure high-frequency content, and the genuine note has
@@ -1174,7 +1224,7 @@ export function CameraScreen() {
     p2.current.bumpPattern    = bumpPattern;
     p2.current.dynamicImage3d = dynamicImage3d;
 
-    console.log(`[P2 Final] frames=${sharpnesses.length} chromaPeak=${chromaPeak.toFixed(4)} chromaSwing=${chromaSwing.toFixed(4)} detail=${detail.toFixed(4)} sharp=${sharpness.toFixed(4)}`);
+    console.log(`[P2 Final] frames=${sharpnesses.length} tiltMoved=${tilt.moved}(${tilt.dist.toFixed(3)}) chromaPeak=${chromaPeak.toFixed(4)} chromaSwing=${chromaSwing.toFixed(4)} detail=${detail.toFixed(4)} sharp=${sharpness.toFixed(4)}`);
 
     updateCheck("Dynamic Movement", dynamicMovement ? "fail" : "pass");
     updateCheck("3D Dynamic Image", dynamicImage3d  ? "fail" : "pass");
