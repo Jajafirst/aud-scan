@@ -298,7 +298,13 @@ const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 // held, which can only be confirmed by watching the live reading while
 // tilting a real phone. If the scale moves the wrong way, or capture never
 // triggers, that's the first thing to check — see the [Tilt] log line.
-const TILT_CAPTURE_THRESHOLD = 0.35; // g — how far you must roll before a side counts as "reached"
+// A scan reported tiltMoved=true (real movement confirmed) on both sides but
+// still a tiny colour swing (0.0055 / 0.0045) — consistent with the phone
+// having genuinely moved without rolling far enough for the ink to actually
+// shift. 0.35g corresponds to roughly sin⁻¹(0.35) ≈ 20°, well short of the
+// ~35° that reliably produced a strong swing before the gyro redesign.
+// Raised so reaching a side demands a real, decisive roll.
+const TILT_CAPTURE_THRESHOLD = 0.55; // g — sin⁻¹(0.55) ≈ 33°
 const TILT_POLL_MS = 40;             // how often the wait loop checks the live reading
 const TILT_WAIT_TIMEOUT_MS = 8000;   // safety net — proceed anyway rather than hang forever
 
@@ -831,9 +837,16 @@ export function CameraScreen() {
   const waitForTilt = async (dir: 1 | -1) => {
     const start = Date.now();
     while (Date.now() - start < TILT_WAIT_TIMEOUT_MS) {
-      if (dir * liveTiltRef.current >= TILT_CAPTURE_THRESHOLD) return;
+      if (dir * liveTiltRef.current >= TILT_CAPTURE_THRESHOLD) {
+        // The reading that actually triggered this capture — the only way to
+        // tell, from the log alone, whether TILT_CAPTURE_THRESHOLD and the
+        // assumed axis are sane on a real device, or need correcting.
+        console.log(`[Tilt] reached dir=${dir} x=${liveTiltRef.current.toFixed(3)} (threshold ${dir * TILT_CAPTURE_THRESHOLD})`);
+        return;
+      }
       await sleep(TILT_POLL_MS);
     }
+    console.log(`[Tilt] TIMED OUT waiting dir=${dir} — last x=${liveTiltRef.current.toFixed(3)}`);
   };
 
   // Waits for the phone to pass back through roughly flat, between the left
@@ -1371,11 +1384,18 @@ export function CameraScreen() {
   // left then right, driven by tiltAnim — the SAME value the capture timing
   // is scheduled against, so this isn't decoration running independently of
   // what the camera does. Tilt the PHONE to keep the dot roughly centred — the note stays put.
+  // tiltAnim is already normalised so +/-1 IS the capture threshold (see the
+  // Accelerometer listener: x / TILT_CAPTURE_THRESHOLD, clamped). So the dot
+  // turning green exactly at the ends of its travel is a literal, real-time
+  // "you're far enough — captures now" signal, not a guess or a delay.
   const GuideTrack = () => (
     <View style={styles.guideTrack}>
       <View style={styles.guideLine} />
       <Animated.View style={[styles.guideDot, {
-        backgroundColor: accent,
+        backgroundColor: tiltAnim.interpolate({
+          inputRange:  [-1,      -0.999,  0,      0.999,   1],
+          outputRange: ["#4ADE80", accent, accent, accent, "#4ADE80"],
+        }),
         transform: [{ translateX: tiltAnim.interpolate({ inputRange: [-1, 1], outputRange: [-80, 80] }) }],
       }]} />
     </View>
