@@ -791,7 +791,15 @@ export function CameraScreen() {
   // not moving between directions — this caps how long one direction waits
   // before accepting whatever it has anyway, rather than hanging the scan.
   const motionStallRef = useRef(0);
-  const MOTION_STALL_LIMIT = 27; // ~27 * 300ms ≈ 8s per direction
+  // Screenshots showed the actual failure: three frames, same timestamp,
+  // the note held in exactly the same spot each time — the 3-second dwell
+  // was completing fine, but the "must look different from the last capture"
+  // check kept rejecting it since the position genuinely hadn't changed, and
+  // the old 8-second stall limit let that rejection run for up to 8s before
+  // giving up and accepting anyway. Tightened to guarantee 5s is the hard
+  // ceiling on ANY single direction, dwell and difference check included —
+  // past that it accepts whatever it has, full stop.
+  const MOTION_STALL_LIMIT = 16; // ~16 * 300ms ≈ 4.8s per direction
   const resetMotion = () => {
     motionPrevThumb.current = null;
     stillStreak.current = 0;
