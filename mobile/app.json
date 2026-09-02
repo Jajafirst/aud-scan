@@ -1,26 +1,28 @@
 {
-  "ios": {
-    "bundleIdentifier": "com.jatupon.audscan",
-    "infoPlist": {
-      "NSMotionUsageDescription": "AUDScan reads the phone's tilt while scanning a banknote, to detect the note's optically variable ink shifting colour as it moves."
-    }
-  },
-  "android": {
-    "package": "com.anonymous.audscanmobile"
-  },
-  "extra": {
-    "eas": {
-      "projectId": "7d7b848b-fc5d-4d25-aaf8-7f864eb4e514"
-    }
-  },
-  "plugins": [
-    [
-      "expo-build-properties",
-      {
-        "ios": {
-          "deploymentTarget": "15.5"
-        }
+  "expo": {
+    "ios": {
+      "bundleIdentifier": "com.jatupon.audscan",
+      "infoPlist": {
+        "NSMotionUsageDescription": "AUDScan reads the phone's tilt while scanning a banknote, to detect the note's optically variable ink shifting colour as it moves."
       }
+    },
+    "android": {
+      "package": "com.anonymous.audscanmobile"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "7d7b848b-fc5d-4d25-aaf8-7f864eb4e514"
+      }
+    },
+    "plugins": [
+      [
+        "expo-build-properties",
+        {
+          "ios": {
+            "deploymentTarget": "15.5"
+          }
+        }
+      ]
     ]
-  ]
+  }
 }
