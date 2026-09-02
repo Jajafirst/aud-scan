@@ -15,33 +15,12 @@ import { decodeJpeg } from "@tensorflow/tfjs-react-native";
 const MODEL_URL       = "https://teachablemachine.withgoogle.com/models/Z11VY1264/";
 const DENOM_THRESHOLD = 0.35;
 const PASS_THRESHOLD  = 0.80;
-// Bird/tilt phases used to run on a fixed timer that GUESSED when the user
-// had finished moving — tuned once for a small motion, then a bigger target
-// angle was asked for without the wait time following, and the screen said
-// HOLD STILL before the user had physically finished tilting. A manual
-// capture button fixed the timing but asked the user to notice a UI state
-// and tap at the right moment, which is its own kind of friction.
+// Capture timing went through several designs before this one: a fixed
+// timer that guessed when the user was done moving, a manual button, then
+// motion detection with a stillness dwell. All were replaced (see
+// SWEEP_HALF_MS near sleep()) by a guide the app itself paces, which sets
+// exactly when each photo is taken instead of trying to infer it.
 //
-// Capture is now fully automatic, driven by watching the camera feed itself:
-// every poll compares this frame to the last one (frameMotion). The phase
-// waits for real movement, then waits for it to stop, then captures — no
-// clock involved, so it can't fire too early, and no button to notice either.
-const MOTION_THUMB          = 16;   // thumbnail side, pixels — cheap on purpose
-const MOTION_MOVE_THRESHOLD = 0.05; // above this, frame-to-frame, counts as "moving"
-// Loosened from 0.02 — a strict "still" threshold fights a real hand, which
-// always has some tremor, especially holding a tilt for several seconds
-// waiting to be accepted. Reported as physically tiring on the wrist; a
-// slightly looser bar reaches "held" sooner without needing the note to stop
-// moving completely.
-const MOTION_STILL_THRESHOLD = 0.035;
-// Tried polling with a separate cheap throwaway photo, saving the full
-// quality capture for the one accepted frame per direction. Reverted: on a
-// real phone, camera shutter time is set by hardware (autofocus, exposure
-// settling), not by the JPEG quality argument, so the "cheap" poll photo
-// wasn't meaningfully faster to CAPTURE — only to encode — while doubling
-// the number of shutter calls made every accepted frame slower, not faster.
-// Back to one photo per tick, reused for both the motion check and analysis.
-const POLL_INTERVAL_MS = 300;
 // One capture per tilt direction — left, right, done. At 3 (with only 2
 // directions) the third capture always repeated "TILT LEFT" again, an extra
 // hold in the exact position already captured, which is exactly the dead
@@ -285,6 +264,19 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
   return Promise.race([p, new Promise<null>(r => setTimeout(() => r(null), ms))]);
 }
 
+const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+
+// Every earlier version of this tried to detect the right moment to capture
+// after the fact — a fixed timer, a rocking animation the capture logic
+// didn't actually watch, motion detection with a stillness dwell. All of
+// them either fired too early, too late, or made the user wait through a
+// state machine. This inverts it: the app SETS the pace with a guide line
+// that sweeps left then right, and captures at the exact instant the line
+// reaches each side. The user's only job is to have the note there when it
+// arrives — following a moving target, not guessing when a hidden detector
+// will decide it's satisfied.
+const SWEEP_HALF_MS = 900; // time for the guide to travel from centre to one side
+
 function getDominantHue(r: tf.Tensor, g: tf.Tensor, b: tf.Tensor): number {
   const rM = r.mean().dataSync()[0] / 255;
   const gM = g.mean().dataSync()[0] / 255;
@@ -341,39 +333,6 @@ function zoneChroma(img: tf.Tensor3D, denom: number | null, zone: Rect): number 
   const max = r.maximum(g).maximum(b);
   const min = r.minimum(g).minimum(b);
   return max.sub(min).mean().dataSync()[0];
-}
-
-// A cheap thumbnail of the NOTE FRAME ONLY, used to detect motion — is the
-// note moving right now, or has it stopped? This replaces every earlier
-// attempt at guessing that from a fixed timer (SETTLE_MS, the rocking
-// animation, a tap button): none of them could tell whether the user had
-// actually finished tilting, only how long it had been since a prompt
-// appeared. Comparing two real frames can — but only if it looks at the
-// note. The first version compared the WHOLE camera frame, so anything
-// moving in the background (an RGB keyboard cycling colours, in one report)
-// registered as motion forever and the phase could never reach "held
-// still," no matter how steady the note was. Same lesson as the zone crops
-// elsewhere in this file: measure the note, not the room.
-function frameThumbnail(raw: Uint8Array, denom: number | null): Float32Array {
-  return tf.tidy(() => {
-    const img   = decodeJpeg(raw, 3);
-    const note  = cropToNote(img, denom);
-    const small = tf.image.resizeBilinear(note, [MOTION_THUMB, MOTION_THUMB]).toFloat();
-    const gray  = small.slice([0, 0, 0], [-1, -1, 1]).mul(0.299)
-      .add(small.slice([0, 0, 1], [-1, -1, 1]).mul(0.587))
-      .add(small.slice([0, 0, 2], [-1, -1, 1]).mul(0.114)).div(255);
-    return gray.dataSync() as Float32Array;
-  });
-}
-
-// Mean per-pixel difference between two thumbnails, 0 (identical) to 1
-// (completely different). No prior frame counts as maximum motion, so the
-// very first poll of a phase never accidentally reads as "already still."
-function frameMotion(prev: Float32Array | null, next: Float32Array): number {
-  if (!prev || prev.length !== next.length) return 1;
-  let sum = 0;
-  for (let i = 0; i < next.length; i++) sum += Math.abs(prev[i] - next[i]);
-  return sum / next.length;
 }
 
 // One zone reduced to a contrast-normalised patch. Normalising means the
@@ -767,49 +726,13 @@ export function CameraScreen() {
   const birdRatio      = useRef<number[]>([]);
   const birdVariance   = useRef<number[]>([]);
   const birdPatches    = useRef<number[][]>([]);
-  const busyRef = useRef(false);
-  // Simplified from an earlier version that required an active tilt-away
-  // motion before it would even start counting toward a capture — reported
-  // as slow and demanding to actually use. This is closer to what was asked
-  // for directly: line the circle up on the note's feature and hold it
-  // there; after DWELL_STILL_TICKS consecutive still polls (about three
-  // seconds), it captures on its own. No separate "prove you moved first"
-  // step.
-  //
-  // lastAcceptedThumb still guards against capturing the SAME position twice
-  // in a row — without it, someone who doesn't actually move between the two
-  // tilt directions would get two near-identical frames, which is useless
-  // for a check that measures the difference between them. The first frame
-  // of a phase has nothing to compare against yet, so it always passes.
-  const motionPrevThumb     = useRef<Float32Array | null>(null);
-  const lastAcceptedThumb   = useRef<Float32Array | null>(null);
-  const stillStreak         = useRef(0);
-  const DWELL_STILL_TICKS   = 10; // ~10 * 300ms = 3s of continuous stillness
-  const MIN_DIFF_FROM_LAST  = 0.03; // must look at least this different from the last accepted frame
-  // Safety net: if this direction never both dwells AND looks different
-  // enough from the last one — an unusually shaky grip, or someone genuinely
-  // not moving between directions — this caps how long one direction waits
-  // before accepting whatever it has anyway, rather than hanging the scan.
-  const motionStallRef = useRef(0);
-  // Screenshots showed the actual failure: three frames, same timestamp,
-  // the note held in exactly the same spot each time — the 3-second dwell
-  // was completing fine, but the "must look different from the last capture"
-  // check kept rejecting it since the position genuinely hadn't changed, and
-  // the old 8-second stall limit let that rejection run for up to 8s before
-  // giving up and accepting anyway. Tightened to guarantee 5s is the hard
-  // ceiling on ANY single direction, dwell and difference check included —
-  // past that it accepts whatever it has, full stop.
-  const MOTION_STALL_LIMIT = 16; // ~16 * 300ms ≈ 4.8s per direction
-  const resetMotion = () => {
-    motionPrevThumb.current = null;
-    stillStreak.current = 0;
-    motionStallRef.current = 0;
-  };
-  // Drives the on-screen status word. "move" = not settled yet (either still
-  // moving, or dwelling long enough but looking too similar to the last
-  // capture), "hold" = counting down the 3-second dwell, "captured" = a
-  // frame was just accepted.
-  const [motionStatus, setMotionStatus] = useState<"move" | "hold" | "captured">("move");
+  // Drives the guide dot sweeping left then right, and is the SAME value the
+  // capture timing is scheduled against (see SWEEP_HALF_MS) — not a decor
+  // animation running independently of what the camera is doing.
+  const tiltAnim = useRef(new Animated.Value(0)).current;
+  // "move" = the guide is sweeping, nothing captured yet this leg. "captured"
+  // = the flash shown right when a photo is taken, at the guide's endpoint.
+  const [motionStatus, setMotionStatus] = useState<"move" | "captured">("move");
 
 
   useEffect(() => { phaseRef.current = phase; }, [phase]);
@@ -932,13 +855,15 @@ export function CameraScreen() {
   // ─── STEP 2: Flying Bird (torch on, tilt all directions) ─────────────────
   // Capture is user-triggered: tilt to the shown direction, tap the button
   // when you're there. No timer decides this for you.
-  const startBirdPhase = () => {
+  // No waiting for the user to be detected as "ready" — the guide dot sets
+  // the pace, and a photo is taken at the instant it reaches each side. See
+  // the SWEEP_HALF_MS comment above sleep() for why this replaced motion
+  // detection entirely, not just its thresholds.
+  const startBirdPhase = async () => {
     setPhase("bird");
     setProgress(0);
     setTiltHint(0);
     setMotionStatus("move");
-    resetMotion();
-    lastAcceptedThumb.current = null; // fresh phase — nothing to differ from yet
     // Clear last scan's samples — these refs outlive a single scan, so without
     // this a second scan without remounting would average in the first note.
     birdBrightness.current = [];
@@ -946,66 +871,41 @@ export function CameraScreen() {
     birdVariance.current   = [];
     birdPatches.current    = [];
     setTorchOn(true);
-    busyRef.current = false;
+    tiltAnim.setValue(0);
 
-    // Every poll uses the SAME photo for both the motion check and, once
-    // stillness is confirmed, the real measurement — one capture per tick,
-    // not two, so this costs nothing extra over the earlier timer version.
-    intervalRef.current = setInterval(async () => {
-      const done = birdPatches.current.length;
-      if (done >= TARGET_FRAMES) {
-        stopInterval();
-        setTorchOn(false);
-        finalizeBird();
-        return;
-      }
-      if (!cameraRef.current || busyRef.current) return;
-      busyRef.current = true;
+    const captureBirdSide = async (side: 0 | 1) => {
+      if (!cameraRef.current) return;
       try {
         const photo = await cameraRef.current.takePictureAsync({
           base64: true, quality: 0.2, skipProcessing: true, shutterSound: false,
         });
         if (!photo?.base64) return;
         const raw = Uint8Array.from(atob(photo.base64), c => c.charCodeAt(0));
-
-        const thumb = frameThumbnail(raw, p1.current.denomination);
-        const motion  = frameMotion(motionPrevThumb.current, thumb);
-        const stalled = motionStallRef.current >= MOTION_STALL_LIMIT;
-        motionPrevThumb.current = thumb;
-        motionStallRef.current += 1;
-
-        if (!stalled && motion >= MOTION_STILL_THRESHOLD) {
-          stillStreak.current = 0;
-          setMotionStatus("move");
-          return;
-        }
-        stillStreak.current += 1;
-        const dwelled = stillStreak.current >= DWELL_STILL_TICKS;
-        const diffFromLast = lastAcceptedThumb.current ? frameMotion(lastAcceptedThumb.current, thumb) : 1;
-        const looksNew = diffFromLast >= MIN_DIFF_FROM_LAST;
-        if (!stalled && !(dwelled && looksNew)) {
-          // Dwelled the full 3s but still looks like the last accepted
-          // frame — nudge back to "move" rather than capturing a duplicate.
-          setMotionStatus(dwelled ? "move" : "hold");
-          return;
-        }
-        lastAcceptedThumb.current = thumb;
-
-        // Held still after real movement — accept this frame.
         const b = analyzeBirdFrame(raw, p1.current.denomination);
         birdBrightness.current.push(b.brightness);
         birdRatio.current.push(b.ratio);
         birdVariance.current.push(b.variance);
         birdPatches.current.push(b.patch);
         runMlDenomination(raw);
+      } catch {}
+      setProgress((side + 1) / TARGET_FRAMES);
+      setMotionStatus("captured");
+    };
 
-        const next = birdPatches.current.length;
-        setProgress(Math.min(next / TARGET_FRAMES, 1));
-        setMotionStatus("captured");
-        resetMotion(); // must see fresh movement before the next side counts
-        setTiltHint(h => (h + 1) % TILT_HINTS.length);
-      } catch {} finally { busyRef.current = false; }
-    }, POLL_INTERVAL_MS);
+    Animated.timing(tiltAnim, { toValue: -1, duration: SWEEP_HALF_MS, useNativeDriver: true }).start();
+    await sleep(SWEEP_HALF_MS);
+    if (phaseRef.current !== "bird") return; // user backed out mid-sweep
+    await captureBirdSide(0);
+    setTiltHint(1);
+    setMotionStatus("move");
+
+    Animated.timing(tiltAnim, { toValue: 1, duration: SWEEP_HALF_MS * 2, useNativeDriver: true }).start();
+    await sleep(SWEEP_HALF_MS * 2);
+    if (phaseRef.current !== "bird") return;
+    await captureBirdSide(1);
+
+    setTorchOn(false);
+    finalizeBird();
   };
 
   const finalizeBird = () => {
@@ -1043,77 +943,46 @@ export function CameraScreen() {
   };
 
   // ─── STEP 3: Phase 1 tilt (front) ────────────────────────────────────────
-  const startPhase1 = () => {
+  const startPhase1 = async () => {
     setPhase("phase1");
     setProgress(0);
     setTiltHint(0);
     setMotionStatus("move");
-    resetMotion();
-    lastAcceptedThumb.current = null; // fresh phase — nothing to differ from yet
-    busyRef.current = false;
+    tiltAnim.setValue(0);
 
-    intervalRef.current = setInterval(async () => {
-      const done = p1.current.oviChromas.length;
-      if (done >= TARGET_FRAMES) {
-        stopInterval();
-        finalizePhase1();
-        setPhase("flip");
-        return;
-      }
-      if (!cameraRef.current || busyRef.current) return;
-      busyRef.current = true;
+    const captureSide = async (side: 0 | 1) => {
+      if (!cameraRef.current) return;
       try {
-        // One photo per tick, reused for both the motion check and the real
-        // measurement. A two-photo version (cheap poll shot, then a second
-        // full-quality shot only once still) was tried and made things
-        // slower, not faster: on a real phone the camera shutter is limited
-        // by hardware — autofocus and exposure settling — not by the JPEG
-        // quality setting, so a "cheap" poll photo isn't meaningfully faster
-        // to CAPTURE, only marginally faster to encode. Doubling the number
-        // of shutter calls at the busiest moment made it worse.
         const photo = await cameraRef.current.takePictureAsync({
           base64: true, quality: 0.4, skipProcessing: true, shutterSound: false,
         });
         if (!photo?.base64) return;
         const raw = Uint8Array.from(atob(photo.base64), c => c.charCodeAt(0));
-
-        const thumb = frameThumbnail(raw, p1.current.denomination);
-        const motion  = frameMotion(motionPrevThumb.current, thumb);
-        const stalled = motionStallRef.current >= MOTION_STALL_LIMIT;
-        motionPrevThumb.current = thumb;
-        motionStallRef.current += 1;
-
-        if (!stalled && motion >= MOTION_STILL_THRESHOLD) {
-          stillStreak.current = 0;
-          setMotionStatus("move");
-          return;
-        }
-        stillStreak.current += 1;
-        const dwelled = stillStreak.current >= DWELL_STILL_TICKS;
-        const diffFromLast = lastAcceptedThumb.current ? frameMotion(lastAcceptedThumb.current, thumb) : 1;
-        const looksNew = diffFromLast >= MIN_DIFF_FROM_LAST;
-        if (!stalled && !(dwelled && looksNew)) {
-          // Dwelled the full 3s but still looks like the last accepted
-          // frame — nudge back to "move" rather than capturing a duplicate.
-          setMotionStatus(dwelled ? "move" : "hold");
-          return;
-        }
-        lastAcceptedThumb.current = thumb;
-
         runMlDenomination(raw);
         const f = analyzePhase1Frame(raw, p1.current.denomination);
         p1.current.oviChromas.push(f.oviChroma);
         p1.current.winVars.push(f.winVar);
         p1.current.winRatios.push(f.bodyLuma > 0 ? f.winLuma / f.bodyLuma : 0);
         p1.current.colorToneFlags.push(f.colorTone);
+      } catch {}
+      setProgress((side + 1) / TARGET_FRAMES);
+      setMotionStatus("captured");
+    };
 
-        const next = p1.current.oviChromas.length;
-        setProgress(Math.min(next / TARGET_FRAMES, 1));
-        setMotionStatus("captured");
-        resetMotion();
-        setTiltHint(h => (h + 1) % TILT_HINTS.length);
-      } catch {} finally { busyRef.current = false; }
-    }, POLL_INTERVAL_MS);
+    Animated.timing(tiltAnim, { toValue: -1, duration: SWEEP_HALF_MS, useNativeDriver: true }).start();
+    await sleep(SWEEP_HALF_MS);
+    if (phaseRef.current !== "phase1") return;
+    await captureSide(0);
+    setTiltHint(1);
+    setMotionStatus("move");
+
+    Animated.timing(tiltAnim, { toValue: 1, duration: SWEEP_HALF_MS * 2, useNativeDriver: true }).start();
+    await sleep(SWEEP_HALF_MS * 2);
+    if (phaseRef.current !== "phase1") return;
+    await captureSide(1);
+
+    finalizePhase1();
+    setPhase("flip");
   };
 
   const finalizePhase1 = () => {
@@ -1156,59 +1025,21 @@ export function CameraScreen() {
   };
 
   // ─── STEP 4: Phase 2 tilt (back) ─────────────────────────────────────────
-  const startPhase2 = () => {
+  const startPhase2 = async () => {
     setPhase("phase2");
     setProgress(0);
     setTiltHint(0);
     setMotionStatus("move");
-    resetMotion();
-    lastAcceptedThumb.current = null; // fresh phase — nothing to differ from yet
-    busyRef.current = false;
+    tiltAnim.setValue(0);
 
-    intervalRef.current = setInterval(async () => {
-      const done = p2.current.sharpnesses.length;
-      if (done >= TARGET_FRAMES) {
-        stopInterval();
-        await finalizePhase2();
-        return;
-      }
-      if (!cameraRef.current || busyRef.current) return;
-      busyRef.current = true;
+    const captureSide = async (side: 0 | 1) => {
+      if (!cameraRef.current) return;
       try {
-        // One photo per tick, reused for both purposes — see the note in
-        // startPhase1 above. The two-photo split made this phase slower, not
-        // faster: shutter time is set by the camera hardware, and doubling
-        // the number of shutter calls per accepted frame cost more than the
-        // lower JPEG quality on the poll shot ever saved.
         const photo = await cameraRef.current.takePictureAsync({
           base64: true, quality: 0.7, skipProcessing: true, shutterSound: false,
         });
         if (!photo?.base64) return;
         const raw = Uint8Array.from(atob(photo.base64), c => c.charCodeAt(0));
-
-        const thumb = frameThumbnail(raw, p1.current.denomination);
-        const motion  = frameMotion(motionPrevThumb.current, thumb);
-        const stalled = motionStallRef.current >= MOTION_STALL_LIMIT;
-        motionPrevThumb.current = thumb;
-        motionStallRef.current += 1;
-
-        if (!stalled && motion >= MOTION_STILL_THRESHOLD) {
-          stillStreak.current = 0;
-          setMotionStatus("move");
-          return;
-        }
-        stillStreak.current += 1;
-        const dwelled = stillStreak.current >= DWELL_STILL_TICKS;
-        const diffFromLast = lastAcceptedThumb.current ? frameMotion(lastAcceptedThumb.current, thumb) : 1;
-        const looksNew = diffFromLast >= MIN_DIFF_FROM_LAST;
-        if (!stalled && !(dwelled && looksNew)) {
-          // Dwelled the full 3s but still looks like the last accepted
-          // frame — nudge back to "move" rather than capturing a duplicate.
-          setMotionStatus(dwelled ? "move" : "hold");
-          return;
-        }
-        lastAcceptedThumb.current = thumb;
-
         const f = analyzePhase2Frame(raw, p1.current.denomination);
         p2.current.oviChromas.push(f.oviChroma);
         p2.current.sharpnesses.push(f.sharpness);
@@ -1220,14 +1051,24 @@ export function CameraScreen() {
           p2.current.bestW      = photo.width  ?? 0;
           p2.current.bestH      = photo.height ?? 0;
         }
+      } catch {}
+      setProgress((side + 1) / TARGET_FRAMES);
+      setMotionStatus("captured");
+    };
 
-        const next = p2.current.sharpnesses.length;
-        setProgress(Math.min(next / TARGET_FRAMES, 1));
-        setMotionStatus("captured");
-        resetMotion();
-        setTiltHint(h => (h + 1) % TILT_HINTS.length);
-      } catch {} finally { busyRef.current = false; }
-    }, POLL_INTERVAL_MS);
+    Animated.timing(tiltAnim, { toValue: -1, duration: SWEEP_HALF_MS, useNativeDriver: true }).start();
+    await sleep(SWEEP_HALF_MS);
+    if (phaseRef.current !== "phase2") return;
+    await captureSide(0);
+    setTiltHint(1);
+    setMotionStatus("move");
+
+    Animated.timing(tiltAnim, { toValue: 1, duration: SWEEP_HALF_MS * 2, useNativeDriver: true }).start();
+    await sleep(SWEEP_HALF_MS * 2);
+    if (phaseRef.current !== "phase2") return;
+    await captureSide(1);
+
+    await finalizePhase2();
   };
 
   const finalizePhase2 = async () => {
@@ -1380,12 +1221,26 @@ export function CameraScreen() {
   };
 
   // ─── Shared pieces ───────────────────────────────────────────────────────
-  // The only status text on the bird/tilt screens — three short states, no
-  // instructions to read, since capture is automatic and needs none.
-  const MotionStatusLine = ({ status, accent }: { status: "move" | "hold" | "captured"; accent: string }) => (
+  // The only status text on the bird/tilt screens — no instructions to read,
+  // since the guide dot sets the pace and captures happen on its own.
+  const MotionStatusLine = ({ status, accent }: { status: "move" | "captured"; accent: string }) => (
     <Text style={[styles.sheetSub, { color: status === "captured" ? "#4ADE80" : accent, fontWeight: "700" }]}>
-      {status === "move" ? "Get it in position…" : status === "hold" ? "Hold still — capturing in a moment…" : "✓ Captured"}
+      {status === "move" ? "Follow the line…" : "✓ Captured"}
     </Text>
+  );
+
+  // The literal thing asked for: a horizontal line with a dot that sweeps
+  // left then right, driven by tiltAnim — the SAME value the capture timing
+  // is scheduled against, so this isn't decoration running independently of
+  // what the camera does. Tilt the note to keep the dot roughly centred.
+  const GuideTrack = () => (
+    <View style={styles.guideTrack}>
+      <View style={styles.guideLine} />
+      <Animated.View style={[styles.guideDot, {
+        backgroundColor: accent,
+        transform: [{ translateX: tiltAnim.interpolate({ inputRange: [-1, 1], outputRange: [-80, 80] }) }],
+      }]} />
+    </View>
   );
 
   const StepDots = ({ active }: { active: number }) => (
@@ -1564,7 +1419,8 @@ export function CameraScreen() {
           </View>
 
           <ProgressBar />
-          <Text style={styles.tip}>Line up the note's bird in the circle, then tilt</Text>
+          <GuideTrack />
+          <Text style={styles.tip}>Line up the note's bird in the circle, then tilt to follow the dot</Text>
           <Text style={styles.tip}>{Math.round(progress * TARGET_FRAMES)}/{TARGET_FRAMES} captured</Text>
         </View>
       </View>
@@ -1699,9 +1555,8 @@ export function CameraScreen() {
         />
       </NoteFrame>
 
-      {/* Static direction indicator: one position to hold the note at. No tap
-          needed — the app watches the camera and captures on its own once it
-          sees the note get there and stop moving. */}
+      {/* Direction indicator. The guide dot below sets the actual pace — this
+          just names which way it's currently sweeping. */}
       <View style={styles.hintFloat} pointerEvents="none">
         <Text style={[styles.hintArrow, { color: accent }]}>{TILT_HINTS[tiltHint].arrow}</Text>
         <Text style={[styles.hintLabel, { color: accent }]}>{TILT_HINTS[tiltHint].label}</Text>
@@ -1722,6 +1577,7 @@ export function CameraScreen() {
         </View>
 
         <ProgressBar />
+        <GuideTrack />
         <Text style={styles.tip}>{Math.round(progress * TARGET_FRAMES)}/{TARGET_FRAMES} captured</Text>
 
         <CheckList items={isPhase2 ? checks.slice(5) : checks.slice(2, 5)} />
@@ -1784,6 +1640,11 @@ const styles = StyleSheet.create({
   },
   hintArrow: { fontSize: 34, fontWeight: "900", lineHeight: 38 },
   hintLabel: { fontSize: 12, fontWeight: "900", letterSpacing: 2.5, marginTop: 2 },
+
+  // ── Guide track ──
+  guideTrack: { height: 24, justifyContent: "center", marginTop: 2, marginBottom: 4 },
+  guideLine:  { height: 2, backgroundColor: "rgba(255,255,255,0.15)", borderRadius: 1 },
+  guideDot:   { position: "absolute", left: "50%", marginLeft: -7, width: 14, height: 14, borderRadius: 7 },
 
   // ── Bird badge ──
   birdBadge: {
