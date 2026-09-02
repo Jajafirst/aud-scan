@@ -1068,6 +1068,16 @@ export function CameraScreen() {
     setProgress(0);
     setTiltHint(0);
     setMotionStatus("move");
+    // Optically variable ink shifts colour because the LIGHT's angle to the
+    // ink changes, not because the camera's viewing angle does. With the
+    // note resting still under fixed room light, tilting only the phone
+    // changes nothing about that geometry — a scan came back with chromaSwing
+    // getting SMALLER after the tilt threshold was raised, which rules out
+    // "not tilted far enough" and points here instead. The torch is mounted
+    // on the phone, so turning it on means tilting the phone now sweeps the
+    // light's angle across the note too, even though the note itself is
+    // static — restoring the mechanism the front/back checks depend on.
+    setTorchOn(true);
 
     const captureSide = async (side: 0 | 1) => {
       if (!cameraRef.current) return;
@@ -1099,6 +1109,7 @@ export function CameraScreen() {
     if (phaseRef.current !== "phase1") return;
     await captureSide(1);
 
+    setTorchOn(false);
     finalizePhase1();
     setPhase("flip");
   };
@@ -1154,6 +1165,7 @@ export function CameraScreen() {
     setProgress(0);
     setTiltHint(0);
     setMotionStatus("move");
+    setTorchOn(true); // see the comment on startPhase1 — same reasoning
 
     const captureSide = async (side: 0 | 1) => {
       if (!cameraRef.current) return;
@@ -1215,6 +1227,7 @@ export function CameraScreen() {
     if (phaseRef.current !== "phase2") return;
     await captureSide(1);
 
+    setTorchOn(false);
     await finalizePhase2();
   };
 
@@ -1724,10 +1737,10 @@ export function CameraScreen() {
   const isPhase2 = phase === "phase2";
   return (
     <View style={styles.root}>
-      <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" onCameraReady={onCameraReady} />
+      <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" enableTorch={torchOn} onCameraReady={onCameraReady} />
       <View style={styles.scrim} pointerEvents="none" />
 
-      <TopBar step={isPhase2 ? 3 : 2} onClose={() => { stopInterval(); navigation.goBack(); }} />
+      <TopBar step={isPhase2 ? 3 : 2} onClose={() => { stopInterval(); setTorchOn(false); navigation.goBack(); }} />
 
       <NoteFrame>
         <Zone
@@ -1749,12 +1762,17 @@ export function CameraScreen() {
             <Text style={styles.sheetTitle}>{isPhase2 ? "Back Side" : "Front Side"}</Text>
             <MotionStatusLine status={motionStatus} accent={accent} />
           </View>
-          {serial ? (
-            <View style={styles.serialTag}>
-              <Text style={styles.serialTagLabel}>SERIAL</Text>
-              <Text style={styles.serialTagValue}>{serial}</Text>
+          <View style={{ alignItems: "flex-end", gap: 6 }}>
+            <View style={[styles.torchChip, { borderColor: accent }]}>
+              <Text style={[styles.torchText, { color: accent }]}>⚡ FLASH ON</Text>
             </View>
-          ) : null}
+            {serial ? (
+              <View style={styles.serialTag}>
+                <Text style={styles.serialTagLabel}>SERIAL</Text>
+                <Text style={styles.serialTagValue}>{serial}</Text>
+              </View>
+            ) : null}
+          </View>
         </View>
 
         <ProgressBar />
