@@ -42,13 +42,13 @@ const MOTION_STILL_THRESHOLD = 0.035;
 // the number of shutter calls made every accepted frame slower, not faster.
 // Back to one photo per tick, reused for both the motion check and analysis.
 const POLL_INTERVAL_MS = 300;
-// Cut from 4 to 3 — each frame means holding a tilt until the app accepts
-// it, and four holds per phase (bird, front, back — twelve total across a
-// scan) was reported as physically tiring. Three still gives every measure
-// enough points to compute a swing or a state count from; it costs some
-// robustness against one clean state-counting evidence in favour of finishing
-// the scan without straining a wrist to get it.
-const TARGET_FRAMES   = 3;
+// One capture per tilt direction — left, right, done. At 3 (with only 2
+// directions) the third capture always repeated "TILT LEFT" again, an extra
+// hold in the exact position already captured, which is exactly the dead
+// time being asked to cut. 2 is now the minimum every check needs anyway:
+// a swing or a state count both require at least two distinct angles, and
+// TH_MIN_STATES already requires both frames to differ to pass.
+const TARGET_FRAMES   = 2;
 
 // Feature thresholds, from two scans of genuine $10 AK173948183 and one of
 // counterfeit AK173948185.
@@ -1129,7 +1129,10 @@ export function CameraScreen() {
     // note and holds a fixed ratio to it.
     const winVar      = median(winVars);
     const ratioSwing  = range(winRatios);
-    const clearWindow = winRatios.length >= 3 && ratioSwing < TH_WINDOW_RATIO_SWING;
+    // Was gated on >= 3 frames, back when TARGET_FRAMES was higher. With only
+    // 2 captured per phase now, that guard would never pass at all — dropped
+    // to match every other swing check's >= 2.
+    const clearWindow = winRatios.length >= 2 && ratioSwing < TH_WINDOW_RATIO_SWING;
 
     // Rolling colour — the patch must either reach a strong colour at some
     // angle, or visibly swing between angles. Printed ink does neither.
