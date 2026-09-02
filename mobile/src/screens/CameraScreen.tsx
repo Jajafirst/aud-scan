@@ -83,7 +83,19 @@ const TH_OVI_SWING_BACK  = 0.010;
 // numbers are PROVISIONAL: the per-scan `dists=[...]` log exists so they can
 // be set from where genuine and counterfeit distances actually fall.
 const TH_PATCH_SAME = 0.60;
-const TH_MIN_STATES = 2;  // between fake 0.0062 and genuine 0.0150
+// Bird: with only 2 frames per phase (one per side), the most the app can
+// ever confirm is "these two looked different" — that's TH_MIN_STATES_BIRD=2,
+// i.e. every captured frame must differ from the one before it.
+const TH_MIN_STATES_BIRD = 2;
+// Reversing numeral: the physical feature has THREE appearances as the light
+// rakes across it — no number, mirrored number, normal number — not two. A
+// note that only shows two different-looking frames could just be catching
+// two random angles of noise, not the actual optical effect. Requiring 3
+// distinct states is a real test of "did we see the whole progression," not
+// just "did anything change" — which is why the numeral gets a dedicated
+// third capture (see the extra shot in startPhase2) that the other checks,
+// tuned for speed, don't need.
+const TH_MIN_STATES_REVERSE = 3;
 const TH_SHARPNESS_MIN   = 0.013;  // below genuine B 0.0207, above fake 0.0095
 const TH_DETAIL_MIN      = 0.012;  // genuine B 0.0202 vs fake 0.0197 — weak
 // Single-frame window variance is kept only for the log — it does not
@@ -275,7 +287,17 @@ const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 // reaches each side. The user's only job is to have the note there when it
 // arrives — following a moving target, not guessing when a hidden detector
 // will decide it's satisfied.
-const SWEEP_HALF_MS = 900; // time for the guide to travel from centre to one side
+// A genuine note's colour swing measured 0.0035 on a scan right after this
+// went live, against ~0.05+ historically on the same physical note — a real
+// regression, not noise. The likely cause: capture is scheduled by TIME, not
+// verified against whether the user actually reached the tilt — at 900ms a
+// hand may still be mid-motion when the shutter fires, so both captured
+// angles land closer together than intended, shrinking every swing
+// measurement regardless of whether the note is genuine. Raised to 1300ms to
+// give a real tilt more time to land before the photo is taken. This is a
+// timing fix, not a threshold fix — loosening TH_OVI_SWING_FRONT instead
+// would have let counterfeits back in along with rescuing genuine notes.
+const SWEEP_HALF_MS = 1300; // time for the guide to travel from centre to one side
 
 function getDominantHue(r: tf.Tensor, g: tf.Tensor, b: tf.Tensor): number {
   const rM = r.mean().dataSync()[0] / 255;
@@ -932,7 +954,7 @@ export function CameraScreen() {
     // 0.512 to 0.362 while the fake's barely moved. Hand movement cannot
     // manufacture a second stable appearance.
     const birdStates = countDistinctStates(birdPatches.current, TH_PATCH_SAME);
-    const flyingBird = birdPatches.current.length >= 2 && birdStates < TH_MIN_STATES;
+    const flyingBird = birdPatches.current.length >= 2 && birdStates < TH_MIN_STATES_BIRD;
     console.log(
       `[Bird Final] frames=${vals.length} states=${birdStates} ` +
       `dists=[${patchDistances(birdPatches.current).map(d => d.toFixed(3)).join(" ")}] ` +
@@ -1064,7 +1086,30 @@ export function CameraScreen() {
     setMotionStatus("move");
 
     Animated.timing(tiltAnim, { toValue: 1, duration: SWEEP_HALF_MS * 2, useNativeDriver: true }).start();
-    await sleep(SWEEP_HALF_MS * 2);
+    // The numeral needs a THIRD sample the other checks don't: the physical
+    // feature has three appearances (no number, mirrored, normal) as light
+    // rakes across it, not two, so two captures can at most confirm "this
+    // changed," never "we actually saw the whole progression." This extra
+    // shot lands roughly where the sweep crosses centre — a different angle
+    // from either side capture — and feeds ONLY numeralPatches; the other
+    // arrays (chroma, sharpness, detail) stay at their normal 2 samples.
+    await sleep(SWEEP_HALF_MS);
+    if (phaseRef.current === "phase2" && cameraRef.current) {
+      try {
+        const midPhoto = await cameraRef.current.takePictureAsync({
+          base64: true, quality: 0.5, skipProcessing: true, shutterSound: false,
+        });
+        if (midPhoto?.base64) {
+          const midRaw = Uint8Array.from(atob(midPhoto.base64), c => c.charCodeAt(0));
+          const midPatch = tf.tidy(() => {
+            const midImg = decodeJpeg(midRaw, 3);
+            return normalizedPatch(midImg, p1.current.denomination, zonesFor(p1.current.denomination).numeral);
+          });
+          p2.current.numeralPatches.push(midPatch);
+        }
+      } catch {}
+    }
+    await sleep(SWEEP_HALF_MS);
     if (phaseRef.current !== "phase2") return;
     await captureSide(1);
 
@@ -1085,7 +1130,7 @@ export function CameraScreen() {
     const numeralRead   = p2.current.numeralPatches.length >= 2;
     // A genuine dome takes more than one appearance across the rock — blank,
     // reversed, normal. A printed dome has exactly one at every angle.
-    p2.current.reversedOk     = numeralStates >= TH_MIN_STATES;
+    p2.current.reversedOk     = numeralStates >= TH_MIN_STATES_REVERSE;
     p2.current.reverseSawText = numeralRead;
     console.log(
       `[Reverse] frames=${p2.current.numeralPatches.length} states=${numeralStates} ` +
