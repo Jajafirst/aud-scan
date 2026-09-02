@@ -1388,18 +1388,41 @@ export function CameraScreen() {
   // Accelerometer listener: x / TILT_CAPTURE_THRESHOLD, clamped). So the dot
   // turning green exactly at the ends of its travel is a literal, real-time
   // "you're far enough — captures now" signal, not a guess or a delay.
-  const GuideTrack = () => (
-    <View style={styles.guideTrack}>
-      <View style={styles.guideLine} />
-      <Animated.View style={[styles.guideDot, {
-        backgroundColor: tiltAnim.interpolate({
-          inputRange:  [-1,      -0.999,  0,      0.999,   1],
-          outputRange: ["#4ADE80", accent, accent, accent, "#4ADE80"],
-        }),
-        transform: [{ translateX: tiltAnim.interpolate({ inputRange: [-1, 1], outputRange: [-80, 80] }) }],
-      }]} />
-    </View>
-  );
+  // Two fixed targets, not just a moving dot — the same shape as a payment
+  // confirmation: reach the target, it fills in and checks off, then the next
+  // one becomes the goal. `progress` already tracks captures as a fraction
+  // (0 → 0.5 → 1 for a 2-frame phase), so which target is "done" reads
+  // directly off it — no separate state to keep in sync.
+  const GuideTrack = () => {
+    const leftDone  = progress >= 0.5;
+    const rightDone = progress >= 1;
+    return (
+      <View style={styles.guideRow}>
+        <View style={[styles.guideTarget, leftDone ? styles.guideTargetDone : { borderColor: accent }]}>
+          {leftDone && <Text style={styles.guideCheck}>✓</Text>}
+        </View>
+        <View style={styles.guideTrack}>
+          <View style={styles.guideLine} />
+          <Animated.View style={[styles.guideDot, {
+            backgroundColor: tiltAnim.interpolate({
+              inputRange:  [-1,      -0.999,  0,      0.999,   1],
+              outputRange: ["#4ADE80", accent, accent, accent, "#4ADE80"],
+            }),
+            transform: [
+              { translateX: tiltAnim.interpolate({ inputRange: [-1, 1], outputRange: [-80, 80] }) },
+              { scale: tiltAnim.interpolate({
+                inputRange:  [-1,   -0.7,  0,   0.7, 1],
+                outputRange: [1.35, 1,     1,   1,   1.35],
+              }) },
+            ],
+          }]} />
+        </View>
+        <View style={[styles.guideTarget, rightDone ? styles.guideTargetDone : { borderColor: accent }]}>
+          {rightDone && <Text style={styles.guideCheck}>✓</Text>}
+        </View>
+      </View>
+    );
+  };
 
   const StepDots = ({ active }: { active: number }) => (
     <View style={styles.dots}>
@@ -1800,9 +1823,17 @@ const styles = StyleSheet.create({
   hintLabel: { fontSize: 12, fontWeight: "900", letterSpacing: 2.5, marginTop: 2 },
 
   // ── Guide track ──
-  guideTrack: { height: 24, justifyContent: "center", marginTop: 2, marginBottom: 4 },
+  guideRow:   { flexDirection: "row", alignItems: "center", gap: 10, marginTop: 4, marginBottom: 6 },
+  guideTrack: { flex: 1, height: 24, justifyContent: "center" },
   guideLine:  { height: 2, backgroundColor: "rgba(255,255,255,0.15)", borderRadius: 1 },
   guideDot:   { position: "absolute", left: "50%", marginLeft: -7, width: 14, height: 14, borderRadius: 7 },
+  guideTarget: {
+    width: 26, height: 26, borderRadius: 13, borderWidth: 2,
+    alignItems: "center", justifyContent: "center",
+    backgroundColor: "rgba(255,255,255,0.05)",
+  },
+  guideTargetDone: { borderColor: "#4ADE80", backgroundColor: "rgba(74,222,128,0.18)" },
+  guideCheck: { color: "#4ADE80", fontSize: 14, fontWeight: "900" },
 
   // ── Bird badge ──
   birdBadge: {
