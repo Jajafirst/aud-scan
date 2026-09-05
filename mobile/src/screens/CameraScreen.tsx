@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from "react";
-import { View, Text, StyleSheet, ActivityIndicator, Animated, Dimensions } from "react-native";
+import { View, Text, StyleSheet, ActivityIndicator, Animated, Dimensions, Easing } from "react-native";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import { Accelerometer } from "expo-sensors";
 import { TouchableOpacity } from "react-native";
@@ -807,6 +807,55 @@ export function CameraScreen() {
   // = the flash shown right when a photo is taken, at that instant.
   const [motionStatus, setMotionStatus] = useState<"move" | "captured">("move");
 
+  // Pure UX layer, no bearing on capture timing (that's still tiltAnimX /
+  // liveTiltRef / waitForTiltAway, untouched). Screen-flash on capture and a
+  // continuous demo sweep inside the note frame — both driven by Animated
+  // values so neither re-renders React at accelerometer/frame rate.
+  const flashOpacity       = useRef(new Animated.Value(0)).current;
+  const sweepAnim          = useRef(new Animated.Value(0)).current;
+  const capturedTextOpacity = useRef(new Animated.Value(0)).current;
+  // Pulses HOLD STILL while the dot sits at the threshold — gated to zero
+  // everywhere else by multiplying with holdOpacity in MotionStatusLine, so
+  // it always runs but is only ever visible in that one zone.
+  const holdPulse = useRef(new Animated.Value(0.55)).current;
+
+  useEffect(() => {
+    if (motionStatus === "captured") {
+      flashOpacity.setValue(0);
+      Animated.parallel([
+        Animated.sequence([
+          Animated.timing(flashOpacity, { toValue: 0.4, duration: 80,  useNativeDriver: true }),
+          Animated.timing(flashOpacity, { toValue: 0,   duration: 220, useNativeDriver: true }),
+        ]),
+        Animated.timing(capturedTextOpacity, { toValue: 1, duration: 150, useNativeDriver: true }),
+      ]).start();
+    } else {
+      Animated.timing(capturedTextOpacity, { toValue: 0, duration: 150, useNativeDriver: true }).start();
+    }
+  }, [motionStatus]);
+
+  useEffect(() => {
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(sweepAnim, { toValue: 1, duration: 900, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
+        Animated.timing(sweepAnim, { toValue: 0, duration: 900, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
+      ]),
+    );
+    loop.start();
+    return () => loop.stop();
+  }, []);
+
+  useEffect(() => {
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(holdPulse, { toValue: 1,    duration: 500, useNativeDriver: true }),
+        Animated.timing(holdPulse, { toValue: 0.55, duration: 500, useNativeDriver: true }),
+      ]),
+    );
+    loop.start();
+    return () => loop.stop();
+  }, []);
+
   // Live accelerometer subscription for the whole scan session — cheaper to
   // keep running than to subscribe/unsubscribe every phase, and short-lived
   // either way since a scan only takes a few seconds.
@@ -1380,46 +1429,99 @@ export function CameraScreen() {
   };
 
   // ─── Shared pieces ───────────────────────────────────────────────────────
-  // The only status text on the bird/tilt screens — no instructions to read,
-  // since the guide dot sets the pace and captures happen on its own.
-  const MotionStatusLine = ({ status, accent }: { status: "move" | "captured"; accent: string }) => (
-    <Text style={[styles.sheetSub, { color: status === "captured" ? "#4ADE80" : accent, fontWeight: "700" }]}>
-      {status === "move" ? "Follow the line…" : "✓ Captured"}
-    </Text>
-  );
-
-  // A single target, reachable by tilting the phone ANY direction — left,
-  // right — NOT up/down. A real scan proved vertical tilt doesn't work: same
-  // genuine note, chromaSwing 0.0204 on a left/right tilt vs 0.0023-0.0053 on
-  // an up/down one, because OVI ink and the reversing numeral respond to
-  // light raking ACROSS the note, not to pitch (see waitForTiltAway). So the
-  // dot only moves and only turns green on the horizontal axis — showing a
-  // vertical target would coach the exact motion that just failed. Still one
-  // point, not two fixed targets: the same physical single-point-and-follow
-  // interaction the user asked for, just horizontal. `progress` tracks
-  // captures as a fraction (0 → 0.5 → 1 for a 2-frame phase), shown as a
-  // small count instead of two separate direction-specific checkmarks.
-  const GuideTrack = () => {
-    const captured = Math.round(progress * TARGET_FRAMES);
+  // Live status text, purely a UX layer over the same tiltAnimX/motionStatus
+  // values the capture logic already drives — none of the underlying timing
+  // changed. Four layers stacked and cross-faded by opacity (all Animated
+  // interpolations, not React state) so this doesn't re-render at
+  // accelerometer rate: TILT LEFT / TILT RIGHT while away from the target,
+  // a pulsing HOLD STILL right at the threshold, and a green CAPTURED flash
+  // the instant a photo is taken.
+  const MotionStatusLine = ({ status, accent }: { status: "move" | "captured"; accent: string }) => {
+    const magSq         = Animated.multiply(tiltAnimX, tiltAnimX);
+    const holdOpacity    = magSq.interpolate({ inputRange: [0, 0.7225, 0.7226, 1], outputRange: [0, 0, 1, 1] });
+    const leftOpacity    = tiltAnimX.interpolate({ inputRange: [-1, -0.85, -0.001, 0, 1], outputRange: [0, 0, 1, 0, 0] });
+    const rightOpacity   = tiltAnimX.interpolate({ inputRange: [-1, 0, 0.001, 0.85, 1], outputRange: [0, 0, 1, 1, 0] });
+    const awayOpacity    = status === "captured" ? 0 : 1;
     return (
-      <View style={styles.guideRow}>
-        <View style={styles.guideArena}>
-          <View style={[styles.guideRing, { borderColor: accent }]} />
-          <Animated.View style={[styles.guideDot, {
-            backgroundColor: Animated.multiply(tiltAnimX, tiltAnimX).interpolate({
-              inputRange:  [0,      0.98,  1],
-              outputRange: [accent, accent, "#4ADE80"],
-              extrapolate: "clamp",
-            }),
-            transform: [
-              { translateX: tiltAnimX.interpolate({ inputRange: [-1, 1], outputRange: [-40, 40] }) },
-            ],
-          }]} />
-        </View>
-        <Text style={[styles.guideCount, { color: accent }]}>{captured}/{TARGET_FRAMES} captured</Text>
+      <View style={styles.statusStack}>
+        <Animated.Text style={[styles.sheetSub, styles.statusLayer, { color: accent, fontWeight: "700", opacity: Animated.multiply(leftOpacity, awayOpacity) }]}>
+          ← TILT LEFT
+        </Animated.Text>
+        <Animated.Text style={[styles.sheetSub, styles.statusLayer, { color: accent, fontWeight: "700", opacity: Animated.multiply(rightOpacity, awayOpacity) }]}>
+          TILT RIGHT →
+        </Animated.Text>
+        <Animated.Text style={[styles.sheetSub, styles.statusLayer, { color: accent, fontWeight: "800", opacity: Animated.multiply(Animated.multiply(holdOpacity, holdPulse), awayOpacity) }]}>
+          HOLD STILL
+        </Animated.Text>
+        <Animated.Text style={[styles.sheetSub, styles.statusLayer, { color: "#4ADE80", fontWeight: "800", opacity: capturedTextOpacity }]}>
+          ✓ CAPTURED
+        </Animated.Text>
       </View>
     );
   };
+
+  // A large horizontal gauge: a bracket at each end marks the actual capture
+  // threshold (±TILT_CAPTURE_THRESHOLD, the same value waitForTiltAway polls
+  // against — not a decorative guess), and the dot's position is tiltAnimX
+  // directly, so "how far the dot has to travel" IS "how far the phone has
+  // to tilt." Direction is not fixed to a side (capture triggers on
+  // magnitude, see waitForTiltAway), so the two pills either side just count
+  // captures 1 and 2 rather than claiming a specific side is "the left one."
+  const TiltGauge = () => {
+    const captured = Math.round(progress * TARGET_FRAMES);
+    const magSq     = Animated.multiply(tiltAnimX, tiltAnimX);
+    const atTarget  = magSq.interpolate({ inputRange: [0, 0.9604, 0.9605, 1], outputRange: [0, 0, 1, 1] });
+    return (
+      <View style={styles.gaugeRow}>
+        <View style={[styles.gaugePill, captured >= 1 ? styles.gaugePillDone : { borderColor: accent }]}>
+          {captured >= 1
+            ? <Text style={styles.gaugeCheck}>✓</Text>
+            : <Text style={[styles.gaugePillNum, { color: accent }]}>1</Text>}
+        </View>
+
+        <View style={styles.gaugeBar}>
+          <View style={[styles.gaugeBracket, styles.gaugeBracketLeft,  { borderColor: accent }]} />
+          <View style={styles.gaugeCenterLine} />
+          <View style={[styles.gaugeBracket, styles.gaugeBracketRight, { borderColor: accent }]} />
+          <Animated.View style={[styles.gaugeDot, {
+            backgroundColor: atTarget.interpolate({ inputRange: [0, 1], outputRange: [accent, "#4ADE80"] }),
+            transform: [
+              { translateX: tiltAnimX.interpolate({ inputRange: [-1, 1], outputRange: [-90, 90], extrapolate: "clamp" }) },
+              { scale: magSq.interpolate({ inputRange: [0, 1], outputRange: [1, 1.4], extrapolate: "clamp" }) },
+            ],
+          }]} />
+        </View>
+
+        <View style={[styles.gaugePill, captured >= TARGET_FRAMES ? styles.gaugePillDone : { borderColor: accent }]}>
+          {captured >= TARGET_FRAMES
+            ? <Text style={styles.gaugeCheck}>✓</Text>
+            : <Text style={[styles.gaugePillNum, { color: accent }]}>2</Text>}
+        </View>
+      </View>
+    );
+  };
+
+  // Demo motion inside the note frame — a double-headed arrow sweeping left
+  // and right on a continuous loop (sweepAnim), showing the rocking motion
+  // rather than just naming it. Dims once a capture lands so it doesn't
+  // compete with the "✓ CAPTURED" status text.
+  const SweepHint = () => (
+    <View style={styles.sweepWrap} pointerEvents="none">
+      <Animated.View style={{
+        opacity: motionStatus === "captured" ? 0.15 : 0.55,
+        transform: [{ translateX: sweepAnim.interpolate({ inputRange: [0, 1], outputRange: [-30, 30] }) }],
+      }}>
+        <Text style={[styles.sweepArrowText, { color: accent }]}>↔</Text>
+      </Animated.View>
+    </View>
+  );
+
+  // Full-screen white flash the instant a capture fires (see the motionStatus
+  // effect near tiltAnimX above) — purely visual confirmation, no bearing on
+  // when the photo was actually taken.
+  const CaptureFlash = () => (
+    <Animated.View pointerEvents="none" style={[styles.captureFlash, { opacity: flashOpacity }]} />
+  );
 
   const StepDots = ({ active }: { active: number }) => (
     <View style={styles.dots}>
@@ -1553,6 +1655,7 @@ export function CameraScreen() {
       <View style={styles.root}>
         <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" enableTorch={torchOn} onCameraReady={onCameraReady} />
         <View style={styles.scrim} pointerEvents="none" />
+        <CaptureFlash />
 
         <TopBar step={1} onClose={() => { stopInterval(); setTorchOn(false); navigation.goBack(); }} />
 
@@ -1577,12 +1680,8 @@ export function CameraScreen() {
               }]} />
             );
           })()}
+          <SweepHint />
         </NoteFrame>
-
-        <View style={styles.hintFloat} pointerEvents="none">
-          <Text style={[styles.hintArrow, { color: accent }]}>{dir.arrow}</Text>
-          <Text style={[styles.hintLabel, { color: accent }]}>{dir.label}</Text>
-        </View>
 
         <View style={styles.sheet}>
           <View style={styles.sheetHead}>
@@ -1596,9 +1695,8 @@ export function CameraScreen() {
           </View>
 
           <ProgressBar />
-          <GuideTrack />
-          <Text style={styles.tip}>Line up the note's bird in the circle, then tilt the phone to follow the scale</Text>
-          <Text style={styles.tip}>{Math.round(progress * TARGET_FRAMES)}/{TARGET_FRAMES} captured</Text>
+          <TiltGauge />
+          <Text style={styles.tip}>Line up the note's bird in the circle, then tilt the phone to follow the dot</Text>
         </View>
       </View>
     );
@@ -1722,6 +1820,7 @@ export function CameraScreen() {
     <View style={styles.root}>
       <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" enableTorch={torchOn} onCameraReady={onCameraReady} />
       <View style={styles.scrim} pointerEvents="none" />
+      <CaptureFlash />
 
       <TopBar step={isPhase2 ? 3 : 2} onClose={() => { stopInterval(); setTorchOn(false); navigation.goBack(); }} />
 
@@ -1730,15 +1829,8 @@ export function CameraScreen() {
           style={styles.zoneOviBand}
           label={isPhase2 ? "COLOUR-SHIFTING FEATURES" : "CLEAR WINDOW & COLOUR SHIFT"}
         />
+        <SweepHint />
       </NoteFrame>
-
-      {/* Rock left/right only — a real scan proved up/down doesn't produce
-          the colour shift these checks need. The dot below sets the pace;
-          this just names the action. */}
-      <View style={styles.hintFloat} pointerEvents="none">
-        <Text style={[styles.hintArrow, { color: accent }]}>↔</Text>
-        <Text style={[styles.hintLabel, { color: accent }]}>TILT LEFT / RIGHT</Text>
-      </View>
 
       <View style={styles.sheet}>
         <View style={styles.sheetHead}>
@@ -1760,8 +1852,7 @@ export function CameraScreen() {
         </View>
 
         <ProgressBar />
-        <GuideTrack />
-        <Text style={styles.tip}>{Math.round(progress * TARGET_FRAMES)}/{TARGET_FRAMES} captured</Text>
+        <TiltGauge />
 
         <CheckList items={isPhase2 ? checks.slice(5) : checks.slice(2, 5)} />
       </View>
@@ -1816,20 +1907,36 @@ const styles = StyleSheet.create({
   zoneSerial:     { top: "3%",    left: "6%",  right: "6%",  height: "8%" },
   zoneOviBand:    { top: "36%",   left: "5%",  right: "5%",  height: "34%" },
 
-  // ── Floating tilt hint ──
-  hintFloat: {
-    position: "absolute", top: "17%", alignSelf: "center",
-    alignItems: "center", zIndex: 5,
-  },
-  hintArrow: { fontSize: 34, fontWeight: "900", lineHeight: 38 },
-  hintLabel: { fontSize: 12, fontWeight: "900", letterSpacing: 2.5, marginTop: 2 },
+  // ── Sweep hint (inside the note frame) ──
+  sweepWrap:      { ...StyleSheet.absoluteFillObject, alignItems: "center", justifyContent: "center" },
+  sweepArrowText: { fontSize: 40, fontWeight: "300" },
 
-  // ── Guide track (single point, horizontal only) ──
-  guideRow:   { alignItems: "center", gap: 6, marginTop: 4, marginBottom: 6 },
-  guideArena: { width: 110, height: 32, alignItems: "center", justifyContent: "center" },
-  guideRing:  { position: "absolute", width: 110, height: 32, borderRadius: 16, borderWidth: 2, backgroundColor: "rgba(255,255,255,0.05)" },
-  guideDot:   { width: 16, height: 16, borderRadius: 8 },
-  guideCount: { fontSize: 11, fontWeight: "800", letterSpacing: 1.5 },
+  // ── Full-screen capture flash ──
+  captureFlash: { ...StyleSheet.absoluteFillObject, backgroundColor: "#fff", zIndex: 20 },
+
+  // ── Live status text (stacked, cross-faded layers) ──
+  statusStack: { height: 20, justifyContent: "center" },
+  statusLayer: { position: "absolute", left: 0, top: 0 },
+
+  // ── Tilt gauge (single point, horizontal only) ──
+  gaugeRow:  { flexDirection: "row", alignItems: "center", gap: 10, marginTop: 4, marginBottom: 6 },
+  gaugeBar:  { flex: 1, height: 40, alignItems: "center", justifyContent: "center" },
+  gaugeCenterLine: { position: "absolute", width: "100%", height: 2, backgroundColor: "rgba(255,255,255,0.15)", borderRadius: 1 },
+  gaugeBracket: {
+    position: "absolute", width: 3, height: 34, borderRadius: 2, borderWidth: 0,
+    backgroundColor: "transparent", borderLeftWidth: 3,
+  },
+  gaugeBracketLeft:  { left: 4 },
+  gaugeBracketRight: { right: 4 },
+  gaugeDot:  { position: "absolute", width: 20, height: 20, borderRadius: 10 },
+  gaugePill: {
+    width: 28, height: 28, borderRadius: 14, borderWidth: 2,
+    alignItems: "center", justifyContent: "center",
+    backgroundColor: "rgba(255,255,255,0.05)",
+  },
+  gaugePillDone: { borderColor: "#4ADE80", backgroundColor: "rgba(74,222,128,0.18)" },
+  gaugePillNum:  { fontSize: 12, fontWeight: "900" },
+  gaugeCheck:    { color: "#4ADE80", fontSize: 14, fontWeight: "900" },
 
   // ── Bird badge ──
   birdBadge: {
