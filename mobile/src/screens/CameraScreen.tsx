@@ -255,17 +255,6 @@ type ScanPhase = "setup" | "loading" | "serial" | "bird" | "phase1" | "flip" | "
 type CheckStatus = "pending" | "pass" | "fail";
 interface CheckItem { label: string; status: CheckStatus }
 
-// Rocking left and right only. Up and down were dropped for two reasons: the
-// user reported reaching those positions was the hard part of the scan, and
-// the features being measured - optically variable ink and the reversing
-// numeral - respond to light raking ACROSS the note, which is the horizontal
-// axis. Four frames still get captured, two at each side, so nothing is lost
-// from the sample count; the motion between them is just far quicker to make.
-const TILT_HINTS = [
-  { arrow: "←", label: "TILT LEFT" },
-  { arrow: "→", label: "TILT RIGHT" },
-];
-
 // The angle the on-screen rocking icon demonstrates, and the number named in
 // the copy. Not a measured requirement — no gyroscope reading backs it — but
 // a concrete target beats "slowly" alone: three genuine scans in a row showed
@@ -741,7 +730,6 @@ export function CameraScreen() {
   const [serial,    setSerial]    = useState<string>("");
   const [denom,     setDenom]     = useState<number | null>(null);
   const [ocrStatus, setOcrStatus] = useState<"scanning" | "found" | "notfound">("scanning");
-  const [tiltHint,  setTiltHint]  = useState(0);
   const [torchOn,   setTorchOn]   = useState(false);
   const [checks, setChecks] = useState<CheckItem[]>([
     { label: "Serial Number",    status: "pending" },
@@ -804,16 +792,20 @@ export function CameraScreen() {
   const birdRatio      = useRef<number[]>([]);
   const birdVariance   = useRef<number[]>([]);
   const birdPatches    = useRef<number[][]>([]);
-  // Drives the on-screen scale, updated live from the accelerometer on every
+  // Drives the on-screen dot, updated live from the accelerometer on every
   // reading (see the Accelerometer subscription below) — a real sensor value,
-  // not a scheduled animation. Reused as-is from the earlier sweep design
-  // since GuideTrack already reads it the same way either way.
-  const tiltAnim = useRef(new Animated.Value(0)).current;
+  // not a scheduled animation. Now 2D: any tilt direction (left/right/
+  // up/down/diagonal) moves the dot toward the target, instead of requiring
+  // a specific signed axis. This also removes the unverified assumption that
+  // the accelerometer's x-axis sign maps to "left" vs "right" on a real
+  // device — direction no longer matters at all, only magnitude.
+  const tiltAnimX = useRef(new Animated.Value(0)).current;
+  const tiltAnimY = useRef(new Animated.Value(0)).current;
   // The live reading itself, for the capture-wait loop to poll. A ref, not
   // state — this updates far too often (every accelerometer sample) to run
   // through React's render cycle.
-  const liveTiltRef = useRef(0);
-  // "move" = waiting for the phone to reach the requested side. "captured"
+  const liveTiltRef = useRef({ x: 0, y: 0 });
+  // "move" = waiting for the phone to reach the target tilt. "captured"
   // = the flash shown right when a photo is taken, at that instant.
   const [motionStatus, setMotionStatus] = useState<"move" | "captured">("move");
 
@@ -822,41 +814,50 @@ export function CameraScreen() {
   // either way since a scan only takes a few seconds.
   useEffect(() => {
     Accelerometer.setUpdateInterval(TILT_POLL_MS);
-    const sub = Accelerometer.addListener(({ x }) => {
-      liveTiltRef.current = x;
-      tiltAnim.setValue(Math.max(-1, Math.min(1, x / TILT_CAPTURE_THRESHOLD)));
+    const sub = Accelerometer.addListener(({ x, y }) => {
+      liveTiltRef.current = { x, y };
+      tiltAnimX.setValue(Math.max(-1, Math.min(1, x / TILT_CAPTURE_THRESHOLD)));
+      tiltAnimY.setValue(Math.max(-1, Math.min(1, y / TILT_CAPTURE_THRESHOLD)));
     });
     return () => sub.remove();
   }, []);
 
-  // Waits for the live tilt reading to cross the threshold in the given
-  // direction, polling every TILT_POLL_MS. Gives up after
-  // TILT_WAIT_TIMEOUT_MS and returns anyway — a stalled sensor or an
+  const tiltMagnitude = () => {
+    const { x, y } = liveTiltRef.current;
+    return Math.sqrt(x * x + y * y);
+  };
+
+  // Waits for the live tilt reading to cross the threshold in ANY direction —
+  // up, down, left, right, or diagonal. Polling every TILT_POLL_MS. Gives up
+  // after TILT_WAIT_TIMEOUT_MS and returns anyway — a stalled sensor or an
   // unusually gentle tilt should not be able to hang the scan forever, same
   // reasoning as every earlier stall fallback in this file.
-  const waitForTilt = async (dir: 1 | -1) => {
+  const waitForTiltAway = async () => {
     const start = Date.now();
     while (Date.now() - start < TILT_WAIT_TIMEOUT_MS) {
-      if (dir * liveTiltRef.current >= TILT_CAPTURE_THRESHOLD) {
+      const mag = tiltMagnitude();
+      if (mag >= TILT_CAPTURE_THRESHOLD) {
         // The reading that actually triggered this capture — the only way to
-        // tell, from the log alone, whether TILT_CAPTURE_THRESHOLD and the
-        // assumed axis are sane on a real device, or need correcting.
-        console.log(`[Tilt] reached dir=${dir} x=${liveTiltRef.current.toFixed(3)} (threshold ${dir * TILT_CAPTURE_THRESHOLD})`);
+        // tell, from the log alone, whether TILT_CAPTURE_THRESHOLD is sane on
+        // a real device, or needs correcting.
+        const { x, y } = liveTiltRef.current;
+        console.log(`[Tilt] reached mag=${mag.toFixed(3)} x=${x.toFixed(3)} y=${y.toFixed(3)} (threshold ${TILT_CAPTURE_THRESHOLD})`);
         return;
       }
       await sleep(TILT_POLL_MS);
     }
-    console.log(`[Tilt] TIMED OUT waiting dir=${dir} — last x=${liveTiltRef.current.toFixed(3)}`);
+    const { x, y } = liveTiltRef.current;
+    console.log(`[Tilt] TIMED OUT waiting for any direction — last x=${x.toFixed(3)} y=${y.toFixed(3)}`);
   };
 
-  // Waits for the phone to pass back through roughly flat, between the left
-  // and right captures — used only for the reversing-numeral's extra middle
-  // shot (see startPhase2), which needs a genuinely different angle from
-  // either side capture, not just "close to the last one."
+  // Waits for the phone to pass back through roughly flat, between the away
+  // and return captures — used only for the reversing-numeral's extra middle
+  // shot (see startPhase2), which needs a genuinely different angle from the
+  // away capture, not just "close to the last one."
   const waitForCenter = async () => {
     const start = Date.now();
     while (Date.now() - start < TILT_WAIT_TIMEOUT_MS / 2) {
-      if (Math.abs(liveTiltRef.current) < TILT_CAPTURE_THRESHOLD * 0.35) return;
+      if (tiltMagnitude() < TILT_CAPTURE_THRESHOLD * 0.35) return;
       await sleep(TILT_POLL_MS);
     }
   };
@@ -985,7 +986,6 @@ export function CameraScreen() {
   const startBirdPhase = async () => {
     setPhase("bird");
     setProgress(0);
-    setTiltHint(0);
     setMotionStatus("move");
     // Clear last scan's samples — these refs outlive a single scan, so without
     // this a second scan without remounting would average in the first note.
@@ -1014,13 +1014,14 @@ export function CameraScreen() {
       setMotionStatus("captured");
     };
 
-    await waitForTilt(-1);
+    await waitForTiltAway();
     if (phaseRef.current !== "bird") return; // user backed out mid-tilt
     await captureBirdSide(0);
-    setTiltHint(1);
     setMotionStatus("move");
 
-    await waitForTilt(1);
+    await waitForCenter();
+    if (phaseRef.current !== "bird") return;
+    await waitForTiltAway();
     if (phaseRef.current !== "bird") return;
     await captureBirdSide(1);
 
@@ -1066,7 +1067,6 @@ export function CameraScreen() {
   const startPhase1 = async () => {
     setPhase("phase1");
     setProgress(0);
-    setTiltHint(0);
     setMotionStatus("move");
     // Optically variable ink shifts colour because the LIGHT's angle to the
     // ink changes, not because the camera's viewing angle does. With the
@@ -1099,13 +1099,14 @@ export function CameraScreen() {
       setMotionStatus("captured");
     };
 
-    await waitForTilt(-1);
+    await waitForTiltAway();
     if (phaseRef.current !== "phase1") return;
     await captureSide(0);
-    setTiltHint(1);
     setMotionStatus("move");
 
-    await waitForTilt(1);
+    await waitForCenter();
+    if (phaseRef.current !== "phase1") return;
+    await waitForTiltAway();
     if (phaseRef.current !== "phase1") return;
     await captureSide(1);
 
@@ -1163,7 +1164,6 @@ export function CameraScreen() {
   const startPhase2 = async () => {
     setPhase("phase2");
     setProgress(0);
-    setTiltHint(0);
     setMotionStatus("move");
     setTorchOn(true); // see the comment on startPhase1 — same reasoning
 
@@ -1192,10 +1192,9 @@ export function CameraScreen() {
       setMotionStatus("captured");
     };
 
-    await waitForTilt(-1);
+    await waitForTiltAway();
     if (phaseRef.current !== "phase2") return;
     await captureSide(0);
-    setTiltHint(1);
     setMotionStatus("move");
 
     // The numeral needs a THIRD sample the other checks don't: the physical
@@ -1203,8 +1202,8 @@ export function CameraScreen() {
     // rakes across it, not two, so two captures can at most confirm "this
     // changed," never "we actually saw the whole progression." This extra
     // shot is taken once the phone passes back through roughly flat, on its
-    // way from the left tilt to the right one — a genuinely different angle
-    // from either side capture — and feeds ONLY numeralPatches; the other
+    // way from the first tilt to the second — a genuinely different angle
+    // from either capture — and feeds ONLY numeralPatches; the other
     // arrays (chroma, sharpness, detail) stay at their normal 2 samples.
     await waitForCenter();
     if (phaseRef.current === "phase2" && cameraRef.current) {
@@ -1223,7 +1222,7 @@ export function CameraScreen() {
       } catch {}
     }
 
-    await waitForTilt(1);
+    await waitForTiltAway();
     if (phaseRef.current !== "phase2") return;
     await captureSide(1);
 
@@ -1393,46 +1392,39 @@ export function CameraScreen() {
     </Text>
   );
 
-  // The literal thing asked for: a horizontal line with a dot that sweeps
-  // left then right, driven by tiltAnim — the SAME value the capture timing
-  // is scheduled against, so this isn't decoration running independently of
-  // what the camera does. Tilt the PHONE to keep the dot roughly centred — the note stays put.
-  // tiltAnim is already normalised so +/-1 IS the capture threshold (see the
-  // Accelerometer listener: x / TILT_CAPTURE_THRESHOLD, clamped). So the dot
-  // turning green exactly at the ends of its travel is a literal, real-time
-  // "you're far enough — captures now" signal, not a guess or a delay.
-  // Two fixed targets, not just a moving dot — the same shape as a payment
-  // confirmation: reach the target, it fills in and checks off, then the next
-  // one becomes the goal. `progress` already tracks captures as a fraction
-  // (0 → 0.5 → 1 for a 2-frame phase), so which target is "done" reads
-  // directly off it — no separate state to keep in sync.
+  // A single target, reachable by tilting the phone ANY direction — left,
+  // right, up, down, or diagonal — instead of two fixed left/right targets.
+  // The dot is driven by the live 2D accelerometer reading (tiltAnimX/Y),
+  // the SAME values the capture timing is scheduled against, so this isn't
+  // decoration running independently of what the camera does. Each axis is
+  // already normalised so magnitude 1 IS the capture threshold (see the
+  // Accelerometer listener: x or y / TILT_CAPTURE_THRESHOLD, clamped), so
+  // the ring lighting up green is a literal, real-time "far enough — capture
+  // now" signal, not a guess or a delay. `progress` still tracks captures as
+  // a fraction (0 → 0.5 → 1 for a 2-frame phase), shown as a small count
+  // instead of two separate direction-specific checkmarks.
   const GuideTrack = () => {
-    const leftDone  = progress >= 0.5;
-    const rightDone = progress >= 1;
+    const captured = Math.round(progress * TARGET_FRAMES);
     return (
       <View style={styles.guideRow}>
-        <View style={[styles.guideTarget, leftDone ? styles.guideTargetDone : { borderColor: accent }]}>
-          {leftDone && <Text style={styles.guideCheck}>✓</Text>}
-        </View>
-        <View style={styles.guideTrack}>
-          <View style={styles.guideLine} />
+        <View style={styles.guideArena}>
+          <View style={[styles.guideRing, { borderColor: accent }]} />
           <Animated.View style={[styles.guideDot, {
-            backgroundColor: tiltAnim.interpolate({
-              inputRange:  [-1,      -0.999,  0,      0.999,   1],
-              outputRange: ["#4ADE80", accent, accent, accent, "#4ADE80"],
+            backgroundColor: Animated.add(
+              Animated.multiply(tiltAnimX, tiltAnimX),
+              Animated.multiply(tiltAnimY, tiltAnimY),
+            ).interpolate({
+              inputRange:  [0,      0.98,  1],
+              outputRange: [accent, accent, "#4ADE80"],
+              extrapolate: "clamp",
             }),
             transform: [
-              { translateX: tiltAnim.interpolate({ inputRange: [-1, 1], outputRange: [-80, 80] }) },
-              { scale: tiltAnim.interpolate({
-                inputRange:  [-1,   -0.7,  0,   0.7, 1],
-                outputRange: [1.35, 1,     1,   1,   1.35],
-              }) },
+              { translateX: tiltAnimX.interpolate({ inputRange: [-1, 1], outputRange: [-40, 40] }) },
+              { translateY: tiltAnimY.interpolate({ inputRange: [-1, 1], outputRange: [-40, 40] }) },
             ],
           }]} />
         </View>
-        <View style={[styles.guideTarget, rightDone ? styles.guideTargetDone : { borderColor: accent }]}>
-          {rightDone && <Text style={styles.guideCheck}>✓</Text>}
-        </View>
+        <Text style={[styles.guideCount, { color: accent }]}>{captured}/{TARGET_FRAMES} captured</Text>
       </View>
     );
   };
@@ -1565,7 +1557,6 @@ export function CameraScreen() {
 
   // ─── STEP 2: BIRD ────────────────────────────────────────────────────────
   if (phase === "bird") {
-    const dir = TILT_HINTS[tiltHint];
     return (
       <View style={styles.root}>
         <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" enableTorch={torchOn} onCameraReady={onCameraReady} />
@@ -1749,11 +1740,12 @@ export function CameraScreen() {
         />
       </NoteFrame>
 
-      {/* Direction indicator. The guide dot below sets the actual pace — this
-          just names which way it's currently sweeping. */}
+      {/* Direction no longer matters — any tilt (left/right/up/down/diagonal)
+          moves the guide dot toward its target. The dot itself sets the pace;
+          this just names the action. */}
       <View style={styles.hintFloat} pointerEvents="none">
-        <Text style={[styles.hintArrow, { color: accent }]}>{TILT_HINTS[tiltHint].arrow}</Text>
-        <Text style={[styles.hintLabel, { color: accent }]}>{TILT_HINTS[tiltHint].label}</Text>
+        <Text style={[styles.hintArrow, { color: accent }]}>↗</Text>
+        <Text style={[styles.hintLabel, { color: accent }]}>TILT ANY WAY</Text>
       </View>
 
       <View style={styles.sheet}>
@@ -1840,18 +1832,12 @@ const styles = StyleSheet.create({
   hintArrow: { fontSize: 34, fontWeight: "900", lineHeight: 38 },
   hintLabel: { fontSize: 12, fontWeight: "900", letterSpacing: 2.5, marginTop: 2 },
 
-  // ── Guide track ──
-  guideRow:   { flexDirection: "row", alignItems: "center", gap: 10, marginTop: 4, marginBottom: 6 },
-  guideTrack: { flex: 1, height: 24, justifyContent: "center" },
-  guideLine:  { height: 2, backgroundColor: "rgba(255,255,255,0.15)", borderRadius: 1 },
-  guideDot:   { position: "absolute", left: "50%", marginLeft: -7, width: 14, height: 14, borderRadius: 7 },
-  guideTarget: {
-    width: 26, height: 26, borderRadius: 13, borderWidth: 2,
-    alignItems: "center", justifyContent: "center",
-    backgroundColor: "rgba(255,255,255,0.05)",
-  },
-  guideTargetDone: { borderColor: "#4ADE80", backgroundColor: "rgba(74,222,128,0.18)" },
-  guideCheck: { color: "#4ADE80", fontSize: 14, fontWeight: "900" },
+  // ── Guide track (single point, any direction) ──
+  guideRow:   { alignItems: "center", gap: 6, marginTop: 4, marginBottom: 6 },
+  guideArena: { width: 100, height: 100, alignItems: "center", justifyContent: "center" },
+  guideRing:  { position: "absolute", width: 100, height: 100, borderRadius: 50, borderWidth: 2, backgroundColor: "rgba(255,255,255,0.05)" },
+  guideDot:   { width: 16, height: 16, borderRadius: 8 },
+  guideCount: { fontSize: 11, fontWeight: "800", letterSpacing: 1.5 },
 
   // ── Bird badge ──
   birdBadge: {
