@@ -794,13 +794,11 @@ export function CameraScreen() {
   const birdPatches    = useRef<number[][]>([]);
   // Drives the on-screen dot, updated live from the accelerometer on every
   // reading (see the Accelerometer subscription below) — a real sensor value,
-  // not a scheduled animation. Now 2D: any tilt direction (left/right/
-  // up/down/diagonal) moves the dot toward the target, instead of requiring
-  // a specific signed axis. This also removes the unverified assumption that
-  // the accelerometer's x-axis sign maps to "left" vs "right" on a real
-  // device — direction no longer matters at all, only magnitude.
+  // not a scheduled animation. Horizontal (x) only: a real scan proved
+  // vertical tilt doesn't produce the OVI/numeral signal these checks need
+  // (see waitForTiltAway), so only x drives the dot and gates a capture. y is
+  // still read into liveTiltRef for the debug log, not for the UI or timing.
   const tiltAnimX = useRef(new Animated.Value(0)).current;
-  const tiltAnimY = useRef(new Animated.Value(0)).current;
   // The live reading itself, for the capture-wait loop to poll. A ref, not
   // state — this updates far too often (every accelerometer sample) to run
   // through React's render cycle.
@@ -817,47 +815,45 @@ export function CameraScreen() {
     const sub = Accelerometer.addListener(({ x, y }) => {
       liveTiltRef.current = { x, y };
       tiltAnimX.setValue(Math.max(-1, Math.min(1, x / TILT_CAPTURE_THRESHOLD)));
-      tiltAnimY.setValue(Math.max(-1, Math.min(1, y / TILT_CAPTURE_THRESHOLD)));
     });
     return () => sub.remove();
   }, []);
 
-  const tiltMagnitude = () => {
-    const { x, y } = liveTiltRef.current;
-    return Math.sqrt(x * x + y * y);
-  };
-
-  // Waits for the live tilt reading to cross the threshold in ANY direction —
-  // up, down, left, right, or diagonal. Polling every TILT_POLL_MS. Gives up
-  // after TILT_WAIT_TIMEOUT_MS and returns anyway — a stalled sensor or an
-  // unusually gentle tilt should not be able to hang the scan forever, same
-  // reasoning as every earlier stall fallback in this file.
+  // A real scan proved the "any direction" version of this wrong: tilting up
+  // and down (vertical, y-axis) collapsed chromaSwing to 0.0023-0.0053 on the
+  // SAME genuine note that hit 0.0204 on a left/right tilt. That matches the
+  // physics that was in this file before the any-direction request: OVI ink
+  // and the reversing numeral respond to light raking ACROSS the note
+  // (horizontal), not to pitch. So the capture trigger reads the horizontal
+  // axis only — y is tracked and shown for feedback, but never gates a
+  // capture. Magnitude-of-both was the bug; only x can actually produce the
+  // signal these checks depend on.
   const waitForTiltAway = async () => {
     const start = Date.now();
     while (Date.now() - start < TILT_WAIT_TIMEOUT_MS) {
-      const mag = tiltMagnitude();
-      if (mag >= TILT_CAPTURE_THRESHOLD) {
+      const { x, y } = liveTiltRef.current;
+      if (Math.abs(x) >= TILT_CAPTURE_THRESHOLD) {
         // The reading that actually triggered this capture — the only way to
         // tell, from the log alone, whether TILT_CAPTURE_THRESHOLD is sane on
         // a real device, or needs correcting.
-        const { x, y } = liveTiltRef.current;
-        console.log(`[Tilt] reached mag=${mag.toFixed(3)} x=${x.toFixed(3)} y=${y.toFixed(3)} (threshold ${TILT_CAPTURE_THRESHOLD})`);
+        console.log(`[Tilt] reached x=${x.toFixed(3)} y=${y.toFixed(3)} (threshold ${TILT_CAPTURE_THRESHOLD})`);
         return;
       }
       await sleep(TILT_POLL_MS);
     }
     const { x, y } = liveTiltRef.current;
-    console.log(`[Tilt] TIMED OUT waiting for any direction — last x=${x.toFixed(3)} y=${y.toFixed(3)}`);
+    console.log(`[Tilt] TIMED OUT waiting for horizontal tilt — last x=${x.toFixed(3)} y=${y.toFixed(3)}`);
   };
 
   // Waits for the phone to pass back through roughly flat, between the away
   // and return captures — used only for the reversing-numeral's extra middle
   // shot (see startPhase2), which needs a genuinely different angle from the
-  // away capture, not just "close to the last one."
+  // away capture, not just "close to the last one." Horizontal only, same
+  // reasoning as waitForTiltAway.
   const waitForCenter = async () => {
     const start = Date.now();
     while (Date.now() - start < TILT_WAIT_TIMEOUT_MS / 2) {
-      if (tiltMagnitude() < TILT_CAPTURE_THRESHOLD * 0.35) return;
+      if (Math.abs(liveTiltRef.current.x) < TILT_CAPTURE_THRESHOLD * 0.35) return;
       await sleep(TILT_POLL_MS);
     }
   };
@@ -1393,16 +1389,16 @@ export function CameraScreen() {
   );
 
   // A single target, reachable by tilting the phone ANY direction — left,
-  // right, up, down, or diagonal — instead of two fixed left/right targets.
-  // The dot is driven by the live 2D accelerometer reading (tiltAnimX/Y),
-  // the SAME values the capture timing is scheduled against, so this isn't
-  // decoration running independently of what the camera does. Each axis is
-  // already normalised so magnitude 1 IS the capture threshold (see the
-  // Accelerometer listener: x or y / TILT_CAPTURE_THRESHOLD, clamped), so
-  // the ring lighting up green is a literal, real-time "far enough — capture
-  // now" signal, not a guess or a delay. `progress` still tracks captures as
-  // a fraction (0 → 0.5 → 1 for a 2-frame phase), shown as a small count
-  // instead of two separate direction-specific checkmarks.
+  // right — NOT up/down. A real scan proved vertical tilt doesn't work: same
+  // genuine note, chromaSwing 0.0204 on a left/right tilt vs 0.0023-0.0053 on
+  // an up/down one, because OVI ink and the reversing numeral respond to
+  // light raking ACROSS the note, not to pitch (see waitForTiltAway). So the
+  // dot only moves and only turns green on the horizontal axis — showing a
+  // vertical target would coach the exact motion that just failed. Still one
+  // point, not two fixed targets: the same physical single-point-and-follow
+  // interaction the user asked for, just horizontal. `progress` tracks
+  // captures as a fraction (0 → 0.5 → 1 for a 2-frame phase), shown as a
+  // small count instead of two separate direction-specific checkmarks.
   const GuideTrack = () => {
     const captured = Math.round(progress * TARGET_FRAMES);
     return (
@@ -1410,17 +1406,13 @@ export function CameraScreen() {
         <View style={styles.guideArena}>
           <View style={[styles.guideRing, { borderColor: accent }]} />
           <Animated.View style={[styles.guideDot, {
-            backgroundColor: Animated.add(
-              Animated.multiply(tiltAnimX, tiltAnimX),
-              Animated.multiply(tiltAnimY, tiltAnimY),
-            ).interpolate({
+            backgroundColor: Animated.multiply(tiltAnimX, tiltAnimX).interpolate({
               inputRange:  [0,      0.98,  1],
               outputRange: [accent, accent, "#4ADE80"],
               extrapolate: "clamp",
             }),
             transform: [
               { translateX: tiltAnimX.interpolate({ inputRange: [-1, 1], outputRange: [-40, 40] }) },
-              { translateY: tiltAnimY.interpolate({ inputRange: [-1, 1], outputRange: [-40, 40] }) },
             ],
           }]} />
         </View>
@@ -1740,12 +1732,12 @@ export function CameraScreen() {
         />
       </NoteFrame>
 
-      {/* Direction no longer matters — any tilt (left/right/up/down/diagonal)
-          moves the guide dot toward its target. The dot itself sets the pace;
+      {/* Rock left/right only — a real scan proved up/down doesn't produce
+          the colour shift these checks need. The dot below sets the pace;
           this just names the action. */}
       <View style={styles.hintFloat} pointerEvents="none">
-        <Text style={[styles.hintArrow, { color: accent }]}>↗</Text>
-        <Text style={[styles.hintLabel, { color: accent }]}>TILT ANY WAY</Text>
+        <Text style={[styles.hintArrow, { color: accent }]}>↔</Text>
+        <Text style={[styles.hintLabel, { color: accent }]}>TILT LEFT / RIGHT</Text>
       </View>
 
       <View style={styles.sheet}>
@@ -1832,10 +1824,10 @@ const styles = StyleSheet.create({
   hintArrow: { fontSize: 34, fontWeight: "900", lineHeight: 38 },
   hintLabel: { fontSize: 12, fontWeight: "900", letterSpacing: 2.5, marginTop: 2 },
 
-  // ── Guide track (single point, any direction) ──
+  // ── Guide track (single point, horizontal only) ──
   guideRow:   { alignItems: "center", gap: 6, marginTop: 4, marginBottom: 6 },
-  guideArena: { width: 100, height: 100, alignItems: "center", justifyContent: "center" },
-  guideRing:  { position: "absolute", width: 100, height: 100, borderRadius: 50, borderWidth: 2, backgroundColor: "rgba(255,255,255,0.05)" },
+  guideArena: { width: 110, height: 32, alignItems: "center", justifyContent: "center" },
+  guideRing:  { position: "absolute", width: 110, height: 32, borderRadius: 16, borderWidth: 2, backgroundColor: "rgba(255,255,255,0.05)" },
   guideDot:   { width: 16, height: 16, borderRadius: 8 },
   guideCount: { fontSize: 11, fontWeight: "800", letterSpacing: 1.5 },
 
